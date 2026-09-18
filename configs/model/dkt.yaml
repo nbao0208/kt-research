@@ -1,0 +1,32 @@
+# DKT model configuration
+# Deep Knowledge Tracing using LSTM/GRU
+
+name: dkt
+variant: core
+rnn_type: lstm
+input_mode: embedding
+
+embedding_dim: 64
+hidden_size: 128
+num_layers: 1
+dropout: 0.2
+bidirectional: false
+
+max_seq_len: 200
+stride: 100
+min_history: 1
+
+loss_scope: target_only
+
+optimizer:
+  name: adamw
+  learning_rate: 0.001
+  weight_decay: 0.00001
+
+trainer:
+  batch_size: 256
+  max_epochs: 50
+  early_stopping_patience: 5
+  gradient_clip_norm: 1.0
+
+seed: 42

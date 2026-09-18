@@ -1,0 +1,23 @@
+# BKT model configuration
+# Bayesian Knowledge Tracing with per-skill parameters.
+
+p_init: 0.3
+p_learn: 0.1
+p_slip: 0.1
+p_guess: 0.2
+
+bounds:
+  min: 0.0001
+  max: 0.9999
+
+constraints:
+  slip_plus_guess_lt_one: true
+
+n_jobs: -1
+
+optimize:
+  method: l-bfgs-b
+  n_restarts: 5
+  max_iter: 1000
+
+fallback_to_global: true

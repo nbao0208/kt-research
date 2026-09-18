@@ -1,0 +1,16 @@
+# Base trainer configuration
+
+device: cpu
+checkpoint_dir: "outputs/artifacts"
+log_every: 10
+eval_every: 1
+
+wandb:
+  enabled: true
+  project: "kt-research"
+  entity: null
+  tags:
+    - kt
+    - lfa
+    - benchmark
+  log_artifacts: true

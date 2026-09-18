@@ -1,0 +1,13 @@
+# @package _global_
+# Configuration for Model Comparison & Statistical Evaluation
+
+defaults:
+  - /data: assistments2017
+  - _self_
+
+version: null
+
+# Reliability Diagrams / Calibration Plot Settings
+calibration_strategy: uniform
+calibration_min_samples: 20
+calibration_n_bins: 10

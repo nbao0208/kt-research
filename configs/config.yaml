@@ -1,0 +1,4 @@
+# Main Hydra configuration entry point
+defaults:
+  - experiment: bkt_assistments
+  - _self_

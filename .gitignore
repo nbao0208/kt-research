@@ -1,10 +1,53 @@
-temp.md
-notebooks/temp.ipynb
+# Environment
+.env
+.env.local
+venv/
+.venv/
+
+# Data
+data/raw/*
 data/external/*
 data/interim/*
 data/processed/*
-data/raw/*
 data/splits/*
+data/raw/**/*
+data/external/**/*
+data/interim/**/*
+data/processed/**/*
+data/splits/**/*
+
+# Outputs
+outputs/*
+outputs/**/*
+
+# IDE
 .idea/
 .vscode/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/temp.ipynb
+
+# W&B
+wandb/
+
+# Temp
+temp.md
+
+#Docs
+docs/
+
+300s
+AGENTS.md

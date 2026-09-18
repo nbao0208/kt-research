@@ -1,0 +1,48 @@
+# ASSISTments 2017 dataset configuration
+# This is the default config for the ASSISTments 2017 released full dataset.
+
+raw_path: "data/raw/ASSISTments Data Mining Competition Dataset/Released Full Dataset/anonymized_full_release_competition_dataset.csv"
+
+processed_dir: "data/processed/assistments2017"
+
+columns:
+  required:
+    - studentId
+    - skill
+    - problemId
+    - correct
+    - startTime
+    - action_num
+  recommended:
+    - timeTaken
+    - hintCount
+    - attemptCount
+    - scaffold
+    - hintTotal
+  auxiliary:
+    - frIsHelpRequest
+    - confidence_BORED
+    - confidence_CONFUSED
+    - confidence_FRUSTRATED
+    - RES_BORED
+    - RES_CONFUSED
+    - timeSinceSkill
+
+student_handling:
+  min_student_interactions: 10
+
+skill_handling:
+  multi_skill_strategy: first
+  noskill_strategy: drop
+  min_skill_interactions: 50
+
+sequence_filter:
+  min_sequence_length: 3
+
+split:
+  protocol: temporal_per_student
+  train_frac: 0.8
+  val_frac: 0.1
+  test_frac: 0.1
+
+seed: 42

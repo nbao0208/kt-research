@@ -1,0 +1,32 @@
+# DBKT model configuration
+# Dynamic Bayesian Knowledge Tracing (Dynamic HMM fallback variant)
+
+name: dbkt
+variant: dynamic_hmm
+
+skill_handling:
+  min_skill_sequences: 20
+  fallback_to_global: true
+
+parameters:
+  constrain_slip_guess: true
+  slip_guess_penalty: 1.0
+
+dynamic_transition:
+  enabled: true
+  use_forgetting: true
+  features:
+    - attempts_before
+    - failure_before
+  use_time_since_last_skill: false
+
+optimizer:
+  method: adam
+  learning_rate: 0.001
+  batch_size: 256
+  max_epochs: 100
+  patience: 8
+  gradient_clip_norm: 1.0
+  tolerance: 0.00001
+
+seed: 42
