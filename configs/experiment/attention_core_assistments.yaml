@@ -1,0 +1,11 @@
+# @package _global_
+# Attention-core experiment configuration
+
+defaults:
+  - /data: assistments2017
+  - /model: attention_kt
+  - /trainer: base
+  - _self_
+
+experiment_name: attention_core_assistments2017_v1
+seed: 42

@@ -1,0 +1,5 @@
+# Debug trainer configuration (overrides base)
+
+max_epochs: 2
+batch_size: 64
+log_every: 1

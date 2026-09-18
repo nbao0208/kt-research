@@ -1,0 +1,22 @@
+# LFA model configuration
+# Logistic Factor Analysis for Knowledge Tracing.
+
+lfa_variant: core
+embedding_dim: 16
+dropout: 0.1
+learning_rate: 0.001
+weight_decay: 1.0e-05
+batch_size: 256
+max_epochs: 50
+early_stopping_patience: 5
+
+seed: 42
+
+aux_features:
+  enabled: false
+  columns:
+    - cum_hints_skill_before
+    - hint_rate_before
+    - cum_retries_skill_before
+  missing_strategy: zero
+  outlier_cap_std: 3.0

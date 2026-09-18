@@ -1,0 +1,15 @@
+# @package _global_
+# LFA-aux experiment configuration
+
+defaults:
+  - /data: assistments2017
+  - /model: lfa
+  - /trainer: base
+  - _self_
+
+experiment_name: lfa_aux_assistments2017_v1
+
+model:
+  lfa_variant: aux
+  aux_features:
+    enabled: true
