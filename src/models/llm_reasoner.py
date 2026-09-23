@@ -4,7 +4,7 @@ import logging
 import os
 import urllib.request
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -146,7 +146,13 @@ class HuggingFaceReasoner(BaseLLMReasoner):
             else:
                 torch_dtype = torch.float32
 
-            device_map = "auto" if "cuda" in str_dev else None
+            if "cuda:" in str_dev:
+                device_map = {"": str_dev}
+            elif "cuda" in str_dev:
+                device_map = "auto"
+            else:
+                device_map = None
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch_dtype,
@@ -161,6 +167,12 @@ class HuggingFaceReasoner(BaseLLMReasoner):
                 "transformers is required for HuggingFaceReasoner. "
                 "Install via: pip install transformers accelerate"
             )
+
+    def to(self, *args, **kwargs):
+        """Prevent recursive .to() crash if HF model is already placed via device_map."""
+        if hasattr(self, "model") and hasattr(self.model, "hf_device_map"):
+            return self
+        return super().to(*args, **kwargs)
 
     @torch.no_grad()
     def extract_hidden_states(

@@ -1,6 +1,6 @@
 import tempfile
 from pathlib import Path
-import pytest
+
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -115,3 +115,67 @@ class TestSFNKTTrainingPipeline:
             assert "gain_auc" in eval_res
             assert "auc" in eval_res["calibrated"]
             assert "active_sample_ratio" in eval_res
+
+    def test_device_resolution_and_fallback(self, monkeypatch):
+        num_q, num_c, d_model = 20, 10, 16
+        model = SFNKTModel(
+            num_questions=num_q,
+            num_concepts=num_c,
+            d_model=d_model,
+            num_queries=2,
+            nheads=2,
+            nlayers=1,
+            dim_feedforward=32,
+            max_seq_len=10,
+            d_llm=32,
+        )
+        llm = MockReasoner(model_name="mock-test", d_llm=32, max_tokens=8)
+        scdt = CognitiveAnomalyRegulator()
+
+        # 1. Single-device fallback (CPU)
+        trainer_cpu = SFNKTTrainer(
+            model=model,
+            llm_reasoner=llm,
+            scdt_regulator=scdt,
+            device=torch.device("cpu"),
+        )
+        assert trainer_cpu.device == torch.device("cpu")
+        assert trainer_cpu.llm_device == torch.device("cpu")
+
+        # 2. Single-device fallback (MPS)
+        trainer_mps = SFNKTTrainer(
+            model=model,
+            llm_reasoner=llm,
+            scdt_regulator=scdt,
+            device=torch.device("mps") if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else torch.device("cpu"),
+        )
+        assert trainer_mps.device == trainer_mps.llm_device
+
+        # Mock .to() so dummy tensors don't require actual physical CUDA cards on local machine
+        monkeypatch.setattr(torch.nn.Module, "to", lambda self, *args, **kwargs: self)
+
+        # 3. Simulated 1-GPU CUDA mode
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+        trainer_1gpu = SFNKTTrainer(
+            model=model,
+            llm_reasoner=llm,
+            scdt_regulator=scdt,
+            device=torch.device("cuda:0"),
+        )
+        assert trainer_1gpu.device == torch.device("cuda:0")
+        assert trainer_1gpu.llm_device == torch.device("cuda:0")
+
+        # 4. Simulated 2-GPU CUDA mode (Pipeline Parallelism)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+        trainer_2gpu = SFNKTTrainer(
+            model=model,
+            llm_reasoner=llm,
+            scdt_regulator=scdt,
+            device=torch.device("cuda"),
+        )
+        assert trainer_2gpu.device == torch.device("cuda:0")
+        assert trainer_2gpu.llm_device == torch.device("cuda:1")
+
+

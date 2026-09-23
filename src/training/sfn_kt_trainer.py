@@ -1,9 +1,8 @@
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import h5py
-
 import numpy as np
 import pandas as pd
 import torch
@@ -55,10 +54,28 @@ class SFNKTTrainer:
         gradient_clip_norm: float = 1.0,
         wandb_logger: Optional[WandbLogger] = None,
     ):
-        self.model = model.to(device)
-        self.llm_reasoner = llm_reasoner.to(device)
+        # Multi-GPU resolution: when 2+ CUDA devices are available and running on CUDA,
+        # place Fast Backbone & Q-Former on cuda:0 and LLM Reasoner on cuda:1.
+        # Otherwise (1 GPU, MPS, CPU), keep both on the same specified device.
+        str_dev = str(device).lower()
+        if torch.cuda.is_available() and torch.cuda.device_count() >= 2 and "cuda" in str_dev:
+            self.device = torch.device("cuda:0")
+            self.llm_device = torch.device("cuda:1")
+            logger.info(
+                "Multi-GPU detected (%d CUDA devices). Using Pipeline Allocation: "
+                "Fast Backbone & Q-Former on %s, LLM Reasoner on %s.",
+                torch.cuda.device_count(),
+                self.device,
+                self.llm_device,
+            )
+        else:
+            self.device = device
+            self.llm_device = device
+            logger.info("Single-device mode: Model and LLM Reasoner running on %s.", self.device)
+
+        self.model = model.to(self.device)
+        self.llm_reasoner = llm_reasoner.to(self.llm_device)
         self.scdt = scdt_regulator
-        self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.h5_cache_path = Path(h5_cache_path)
         self.metadata = metadata_manager
@@ -361,7 +378,11 @@ class SFNKTTrainer:
             qformer_optimizer = torch.optim.AdamW(
                 self.model.qformer.parameters(), lr=1e-3, weight_decay=1e-4
             )
-            align_batch_size = min(32 if "mps" in str(self.device).lower() else 64, alignment_size)
+            is_hf_llm = hasattr(self.llm_reasoner, "model")
+            align_batch_size = min(
+                16 if is_hf_llm else (32 if "mps" in str(self.device).lower() else 64),
+                alignment_size,
+            )
 
             # Step 2.2a: Pre-extract H_cot for the alignment subset with progress bar
             logger.info("Extracting H_cot representations for Q-Former alignment subset...")
@@ -484,7 +505,8 @@ class SFNKTTrainer:
             )
 
             if n_uncached > 0:
-                cache_chunk_size = 32 if "mps" in str(self.device).lower() else 64
+                is_hf_llm = hasattr(self.llm_reasoner, "model")
+                cache_chunk_size = 16 if is_hf_llm else (32 if "mps" in str(self.device).lower() else 64)
                 pbar_cache = tqdm(
                     range(0, n_uncached, cache_chunk_size),
                     desc="Stage 2 [Step 2.3: Offline HDF5 Caching]",
@@ -504,6 +526,8 @@ class SFNKTTrainer:
                             concept_ids=c_list,
                             responses=r_list,
                         )
+                        if h_cot.device != self.device:
+                            h_cot = h_cot.to(self.device)
                         z_cog = self.model.qformer(h_cot)  # [chunk, M, d]
                         z_np = z_cog.cpu().numpy().astype(np.float16)
 

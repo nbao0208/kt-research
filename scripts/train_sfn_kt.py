@@ -1,14 +1,12 @@
 import argparse
-import logging
 import sys
 from pathlib import Path
 
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import hydra
-from omegaconf import DictConfig, OmegaConf
 import torch
+from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from src.data.xes3g5m import XES3G5MDataset, XES3G5MMetadata, collate_xes3g5m_batch
@@ -184,8 +182,17 @@ def run_training():
 
     # 2. Initialize Model Components
     metadata_mgr = XES3G5MMetadata(data_cfg.metadata_dir)
+    llm_cfg_dict = OmegaConf.to_container(cfg.model.llm, resolve=True)
+
+    # Auto-resolve LLM device if multi-GPU is available
+    if torch.cuda.is_available() and torch.cuda.device_count() >= 2 and str(device).startswith("cuda"):
+        if llm_cfg_dict.get("device") in [None, "cpu", "auto"]:
+            llm_cfg_dict["device"] = "cuda:1"
+    elif llm_cfg_dict.get("device") in [None, "cpu", "auto"]:
+        llm_cfg_dict["device"] = str(device)
+
     llm_reasoner = build_llm_reasoner(
-        OmegaConf.to_container(cfg.model.llm, resolve=True),
+        llm_cfg_dict,
         metadata_manager=metadata_mgr,
     )
 
