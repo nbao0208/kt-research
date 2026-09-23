@@ -28,3 +28,7 @@ black>=23.0.0
 
 # Utilities
 tqdm>=4.65.0
+
+# LLM
+transformers
+accelerate

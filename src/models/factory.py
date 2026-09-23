@@ -8,6 +8,7 @@ from src.models.bkt import BKT, BKTTrainer
 from src.models.dbkt import DBKTTrainer, DynamicBayesianKnowledgeTracing
 from src.models.dkt import DeepKnowledgeTracing
 from src.models.lfa import LFAAux, LFACore
+from src.models.sfn_kt import SFNKTModel
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +18,10 @@ def build_model(
     num_skills: int,
     num_students: Optional[int] = None,
     device: Optional[torch.device] = None,
+    num_questions: Optional[int] = None,
 ) -> object:
     model_name = cfg.get("name", "")
+
 
     if model_name == "bkt":
         return BKT(
@@ -81,6 +84,20 @@ def build_model(
             use_position=cfg.get("use_position", True),
             use_decay=cfg.get("use_decay", True),
             decay_type=cfg.get("decay_type", "position"),
+        )
+
+    elif model_name == "sfn_kt":
+        return SFNKTModel(
+            num_questions=num_questions or cfg.get("num_questions", 7652),
+            num_concepts=num_skills or cfg.get("num_concepts", 1175),
+            d_model=cfg.get("d_model", 128),
+            num_queries=cfg.get("num_queries", 4),
+            nheads=cfg.get("nheads", 4),
+            nlayers=cfg.get("nlayers", 2),
+            dim_feedforward=cfg.get("dim_feedforward", 512),
+            dropout=cfg.get("dropout", 0.1),
+            max_seq_len=cfg.get("max_seq_len", 200),
+            d_llm=cfg.get("d_llm", 2048),
         )
 
     else:

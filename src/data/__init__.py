@@ -4,6 +4,7 @@ from src.data.sequence import build_bkt_sequences, compute_sequence_metadata
 from src.data.sequence_builder import SequenceBatch, build_student_sequences, pad_sequences
 from src.data.sequence_dataset import SequenceDataset, build_sequence_dataset, collate_sequence_batch
 from src.data.splits import temporal_per_student_split
+from src.data.xes3g5m import XES3G5MDataset, XES3G5MMetadata, collate_xes3g5m_batch
 
 __all__ = [
     "load_raw",
@@ -22,4 +23,8 @@ __all__ = [
     "SequenceDataset",
     "build_sequence_dataset",
     "collate_sequence_batch",
+    "XES3G5MDataset",
+    "XES3G5MMetadata",
+    "collate_xes3g5m_batch",
 ]
+

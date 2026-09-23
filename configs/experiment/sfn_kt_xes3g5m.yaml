@@ -1,0 +1,24 @@
+defaults:
+  - /data: xes3g5m
+  - /model: sfn_kt
+  - _self_
+
+experiment_name: sfn_kt_xes3g5m_default
+seed: 42
+
+trainer:
+  device: auto
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 64
+  stage1_epochs: 10
+  stage2_epochs: 3
+  stage3_epochs: 15
+  warmup_epochs: 5
+  gradient_clip_norm: 1.0
+  checkpoint_dir: outputs/artifacts
+  h5_cache_path: outputs/artifacts/sfn_kt_xes3g5m_default/cognitive_qformer_cache.h5
+  wandb:
+    enabled: false
+    project: kt-research
+    tags: ["sfn_kt", "xes3g5m"]

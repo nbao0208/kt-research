@@ -38,18 +38,22 @@ kt-research/
 ├── src/                        # Reusable source code
 │   ├── data/                   # Loading, preprocessing, splitting, sequences
 │   │   ├── sequence_builder.py # Student sequence construction and padding
-│   │   └── sequence_dataset.py # PyTorch Dataset for sequence models
+│   │   ├── sequence_dataset.py # PyTorch Dataset for sequence models
+│   │   └── xes3g5m.py          # XES3G5M dataset loader & metadata parsing
 │   ├── evaluation/             # Metrics, bootstrap, evaluators
 │   ├── features/               # Feature engineering, encoders
-│   ├── models/                 # BKT, LFA, DBKT, DKT, Attention, baselines
+│   ├── models/                 # BKT, LFA, DBKT, DKT, Attention, SFN-KT, baselines
 │   │   ├── dbkt.py             # Dynamic Bayesian Knowledge Tracing
 │   │   ├── dkt.py              # Deep Knowledge Tracing (LSTM/GRU)
 │   │   ├── attention_kt.py     # Attention-based Contextual KT
+│   │   ├── sfn_kt.py           # SFN-KT: Rasch, Backbone, SCDT, Q-Former, Adapter
+│   │   ├── llm_reasoner.py     # Foundation LLM Reasoner & Counterfactual prompts
 │   │   └── factory.py          # Model factory from config
 │   ├── training/               # Training loop, early stopping, sequence trainer
-│   │   └── sequence_trainer.py # Generic trainer for DKT, Attention
+│   │   ├── sequence_trainer.py # Generic trainer for DKT, Attention
+│   │   └── sfn_kt_trainer.py   # 3-stage decoupled trainer for SFN-KT
 │   └── utils/                  # Seed, logging, I/O helpers
-├── tests/                      # Unit tests with synthetic data
+├── tests/                      # Unit tests with synthetic & mock data
 ├── .env.example                # W&B configuration template
 ├── .gitignore
 ├── Makefile                    # Common commands
@@ -215,6 +219,68 @@ python scripts/compare_models.py
 
 Output: `outputs/comparison/model_comparison.json`, `outputs/comparison/model_comparison.md`. Includes all trained models: baselines, BKT, LFA-core, LFA-aux, DBKT-core, DKT-core, Attention-core.
 
+### SFN-KT on XES3G5M Dataset
+
+SFN-KT (Selective Foundation-Neural Knowledge Tracing) is trained and evaluated on the large-scale **XES3G5M** dataset using a 3-stage decoupled pipeline.
+
+> [!NOTE]
+> Always execute commands using the Conda environment:
+> `conda run -n kt-research-env python <script>`
+
+#### 1. Preprocess & Validate XES3G5M Metadata
+
+Verify and cache split integrity (0 student UID overlap between train/val folds and held-out test), question metadata, KC route maps, and RoBERTa embeddings:
+
+```bash
+conda run -n kt-research-env python scripts/preprocess_xes3g5m.py
+```
+
+Output: `data/processed/xes3g5m/dataset_summary.json`
+
+#### 2. Train SFN-KT (3-Stage Decoupled Pipeline)
+
+You can train all stages end-to-end or run individual stages (`1`, `2`, `3`, or `all`). The LLM model name and backend can be passed directly from the terminal CLI:
+
+```bash
+# Run all stages end-to-end with Mock/RoBERTa reasoner (smoke test)
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage all --smoke-test
+
+# Train Stage 1: Fast Causal Backbone
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 1 --epochs 20 --batch-size 64
+
+# Train Stage 2: Selective Cognitive Dilemma Trigger (SCDT) scan & Cognitive Q-Former caching
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 2 \
+  --llm Qwen/Qwen2.5-Math-7B \
+  --llm-backend huggingface \
+  --llm-d-llm 3584
+
+# Alternatively with DeepSeek-R1 Distill or OpenAI API:
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 2 \
+  --llm deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --llm-backend huggingface \
+  --llm-d-llm 1536
+
+# Train Stage 3: Multi-Anchor Causal Adapter Warm-Up & Joint Calibration (Soft-ECE)
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 3 --epochs 15
+```
+
+Artifacts generated:
+- Stage 1: `outputs/artifacts/{exp}/fast_backbone_best.pt`
+- Stage 2: `outputs/artifacts/{exp}/cognitive_qformer_cache.h5` (offline compressed HDF5 tensor cache)
+- Stage 3: `outputs/artifacts/{exp}/sfn_kt_best.pt`
+
+#### 3. Standalone SFN-KT Evaluation
+
+Compare Base Fast Backbone against Calibrated SFN-KT on the held-out test set:
+
+```bash
+conda run -n kt-research-env python scripts/evaluate_sfn_kt.py --smoke-test
+# Or full test set:
+conda run -n kt-research-env python scripts/evaluate_sfn_kt.py --checkpoint outputs/artifacts/sfn_kt_xes3g5m_default/sfn_kt_best.pt
+```
+
+Outputs: `outputs/metrics/{exp}/test_eval_predictions.parquet`, `outputs/metrics/{exp}/evaluation_report.json`
+
 ## Running Tests
 
 ```bash
@@ -311,6 +377,35 @@ SAKT/AKT hybrid with causal multi-head attention over past interactions:
 - Online history buffer with `max_seq_len` truncation
 
 Reference: Hybrid of SAKT (Pandey & Karypis, 2019) and AKT (Ghosh et al., 2020).
+
+### SFN-KT (Selective Foundation-Neural Knowledge Tracing)
+
+Selective Foundation-Neural KT architecture designed for high throughput and deep pedagogical reasoning on multi-modal benchmark datasets (XES3G5M):
+
+- **Module 1: Rasch-Parameterized Input Embedding**:
+  - Incorporates question difficulty $\beta_q$, discrimination $\alpha_q$, KC embedding $\mathbf{e}_{c_t}$, and response correctness $\mathbf{r}_t$.
+  - Strictly leak-free: interaction embedding $\mathbf{x}_t$ uses response $r_t$, while target query $\mathbf{q}_{t+1}$ contains only question identity and item characteristics without target response.
+- **Module 2: Fast Sequential Backbone**:
+  - 4-layer Causal Transformer Encoder ($d=128$, 8 heads) processing interaction sequences at $\mathcal{O}(T)$ inference step latency.
+  - Strict causal masking: $M_{ij} = -\infty$ for $i < j$, guaranteeing zero future leakage.
+- **Module 3: Selective Cognitive Dilemma Trigger (SCDT)**:
+  - Anomaly regulator monitoring:
+    1. Epistemic uncertainty: $\mathcal{H}(\hat{y}_t) = -[\hat{y}_t \log \hat{y}_t + (1-\hat{y}_t) \log (1-\hat{y}_t)]$.
+    2. Consecutive failure momentum: $F_t = \sum_{k=0}^{\min(t, K)-1} \lambda^k \cdot \mathbb{I}(r_{t-k} = 0)$.
+    3. Slip/Guess cognitive conflict score: $C_t = |\hat{y}_t - (1 - \sigma(\beta_{q_t}))|$.
+  - Triggers foundation reasoning only on anomalous interactions ($\sim 5\text{--}10\%$ of steps), keeping $90\text{--}95\%$ on the fast neural backbone.
+- **Module 4: Foundation Reasoning Core & Cognitive Q-Former**:
+  - Track B: Sparse Context Counterfactual Error Hypothesis prompt using strictly past interactions ($1 \dots t-1$), question stem, options, and KC taxonomy.
+  - Cognitive Q-Former with $M=4$ learnable queries compresses variable-length LLM hidden states ($\mathbb{R}^{L \times d_{\text{LLM}}}$) into compact cognitive representations $\mathbf{Z}_t^{\text{cog}} \in \mathbb{R}^{M \times d}$.
+  - Offline HDF5 caching decouples expensive LLM inference from adapter tuning.
+- **Module 5: Multi-Anchor Causal Adapter & Residual Highway**:
+  - Dual causal/trigger masked cross-attention incorporates $\mathbf{Z}_k^{\text{cog}}$ only at triggered past steps ($k \le t, \tau_k = 1$).
+  - Residual Highway with learnable scalar gating parameter $\gamma$ (initialized to $0.0$) ensures SFN-KT performance is strictly bounded below by the fast neural backbone.
+- **Loss Functions**:
+  - Cognitive-Weighted BCE Loss: $\mathcal{L}_{\text{BCE}}^{\text{cog}} = - \frac{1}{N} \sum_t w_t [y_t \log \hat{y}_t + (1 - y_t) \log (1 - \hat{y}_t)]$ where $w_t = 1 + \alpha \cdot \tau_t$ ($\alpha = 0.75$).
+  - Soft-ECE Loss: Differentiable Expected Calibration Error using 10 soft Sigmoid bins to align predicted probabilities with empirical mastery.
+
+Reference: `docs/sfn-kt/model_arch.md`.
 
 ### Baselines
 

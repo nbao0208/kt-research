@@ -1,0 +1,14 @@
+name: xes3g5m
+raw_dir: data/raw/XES3G5M
+processed_dir: data/processed/xes3g5m
+kc_level_file: data/raw/XES3G5M/kc_level/train_valid_sequences.csv
+test_file: data/raw/XES3G5M/kc_level/test.csv
+metadata_dir: data/raw/XES3G5M/metadata
+num_questions: 7652
+num_concepts: 1175
+max_seq_len: 200
+
+# 5-fold student-level partition
+train_folds: [0, 1, 2]
+val_fold: 3
+test_fold: 4

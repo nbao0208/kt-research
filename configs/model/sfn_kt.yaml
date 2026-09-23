@@ -1,0 +1,36 @@
+name: sfn_kt
+
+# Fast Sequential Backbone & Embeddings
+d_model: 128
+num_queries: 4
+nheads: 4
+nlayers: 2
+dim_feedforward: 512
+dropout: 0.1
+max_seq_len: 200
+d_llm: 2048
+
+# Cognitive Anomaly Regulator (SCDT)
+scdt:
+  lambda_entropy: 0.3
+  target_trigger_rate: 0.05
+  lambda_momentum: 0.0 # Failure momentum weight (0.0 = disabled)
+  lambda_conflict: 0.0 # Slip/guess conflict weight (0.0 = disabled)
+
+# Composite Loss Parameters
+loss:
+  alpha: 0.75
+  beta: 0.1
+  tau_s: 0.05
+
+# Foundation Model Reasoning Core (LLM)
+llm:
+  backend: mock # Options: 'mock', 'huggingface', 'vllm', 'api'
+  model_name: Qwen/Qwen2.5-Math-7B # e.g. 'Qwen/Qwen2.5-Math-7B', 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B'
+  d_llm: 2048
+  max_tokens: 32
+  device: cpu
+  target_layer: -2
+  api_key: null
+  base_url: null
+

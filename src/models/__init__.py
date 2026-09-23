@@ -12,6 +12,23 @@ from src.models.dbkt import DBKTOnlineEvaluator, DBKTTrainer, DynamicBayesianKno
 from src.models.dkt import DKTOnlineEvaluator, DeepKnowledgeTracing
 from src.models.factory import build_model
 from src.models.lfa import LFAAux, LFACore, LFAOnlineEvaluator, LFATrainer
+from src.models.llm_reasoner import (
+    BaseLLMReasoner,
+    HuggingFaceReasoner,
+    MockReasoner,
+    PedagogicalPromptBuilder,
+    build_llm_reasoner,
+)
+from src.models.sfn_kt import (
+    CognitiveAnomalyRegulator,
+    CognitiveQFormer,
+    CognitiveWeightedBCELoss,
+    FastSequentialBackbone,
+    MultiAnchorCausalCognitiveAdapter,
+    RaschInputEmbedding,
+    SFNKTModel,
+    SoftECELoss,
+)
 
 __all__ = [
     "MajorityBaseline",
@@ -37,4 +54,18 @@ __all__ = [
     "AttentiveContextualKT",
     "AttentionOnlineEvaluator",
     "build_model",
+    "SFNKTModel",
+    "RaschInputEmbedding",
+    "FastSequentialBackbone",
+    "CognitiveAnomalyRegulator",
+    "CognitiveQFormer",
+    "MultiAnchorCausalCognitiveAdapter",
+    "CognitiveWeightedBCELoss",
+    "SoftECELoss",
+    "PedagogicalPromptBuilder",
+    "BaseLLMReasoner",
+    "HuggingFaceReasoner",
+    "MockReasoner",
+    "build_llm_reasoner",
 ]
+
