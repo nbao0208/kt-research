@@ -201,18 +201,24 @@ class HuggingFaceReasoner(BaseLLMReasoner):
             pad_token_id=self.tokenizer.pad_token_id,
         )
 
-        # Extract hidden states of generated tokens at target layer
-        # outputs.hidden_states is a tuple of generated steps
-        # each step is a tuple of layer hidden states
-        step_hidden_states = []
-        for step in outputs.hidden_states:
-            # step[self.target_layer]: [Batch, 1, d_llm]
-            step_hidden_states.append(step[self.target_layer])
-
-        if step_hidden_states:
-            h_cot = torch.cat(step_hidden_states, dim=1)  # [Batch, K, d_llm]
+        # Extract hidden states of generated reasoning tokens at target layer
+        # Note: outputs.hidden_states[0] corresponds to the prefill prompt tokens (variable length).
+        # outputs.hidden_states[1:] corresponds to the generated reasoning steps (each shape [Batch, 1, d_llm]).
+        if outputs.hidden_states and len(outputs.hidden_states) > 1:
+            step_hidden_states = [step[self.target_layer] for step in outputs.hidden_states[1:]]
+            h_cot = torch.cat(step_hidden_states, dim=1)  # [Batch, N_gen, d_llm]
+        elif outputs.hidden_states and len(outputs.hidden_states) == 1:
+            # Fallback if no new tokens generated: take last token of prompt
+            h_cot = outputs.hidden_states[0][self.target_layer][:, -1:, :]
         else:
             h_cot = torch.zeros(len(prompts), self.max_tokens, self.d_llm, device=self.model.device)
+
+        # Enforce strict uniform sequence dimension [Batch, self.max_tokens, self.d_llm]
+        cur_len = h_cot.shape[1]
+        if cur_len < self.max_tokens:
+            h_cot = torch.nn.functional.pad(h_cot, (0, 0, 0, self.max_tokens - cur_len))
+        elif cur_len > self.max_tokens:
+            h_cot = h_cot[:, :self.max_tokens, :]
 
         return h_cot.to(torch.float32)
 

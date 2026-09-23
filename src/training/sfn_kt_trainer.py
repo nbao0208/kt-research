@@ -408,7 +408,16 @@ class SFNKTTrainer:
                     )
                 alignment_h_cot.append(h_chunk.cpu())
 
-            all_alignment_h_cot = torch.cat(alignment_h_cot, dim=0)  # [N_align, K, d_llm]
+            # Ensure uniform sequence length K across all chunks before concatenation
+            target_k = max(h.shape[1] for h in alignment_h_cot)
+            norm_chunks = []
+            for h in alignment_h_cot:
+                if h.shape[1] < target_k:
+                    h = torch.nn.functional.pad(h, (0, 0, 0, target_k - h.shape[1]))
+                elif h.shape[1] > target_k:
+                    h = h[:, :target_k, :]
+                norm_chunks.append(h)
+            all_alignment_h_cot = torch.cat(norm_chunks, dim=0)  # [N_align, K, d_llm]
 
             # Step 2.2b: Train Q-Former for stage2_epochs on GPU/VRAM with rapid convergence
             pbar_epochs = tqdm(range(1, self.stage2_epochs + 1), desc="Stage 2 [Step 2.2: Q-Former Alignment Training]")
