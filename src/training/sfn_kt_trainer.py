@@ -1,6 +1,8 @@
+import copy
+import concurrent.futures
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
@@ -57,6 +59,8 @@ class SFNKTTrainer:
         tau_s: float = 0.05,
         gradient_clip_norm: float = 1.0,
         wandb_logger: Optional[WandbLogger] = None,
+        cache_batch_size: Optional[int] = None,
+        cache_workers: Optional[int] = None,
     ):
         # Multi-GPU resolution: when 2+ CUDA devices are available and running on CUDA,
         # place Fast Backbone & Q-Former on cuda:0 and LLM Reasoner on cuda:1.
@@ -96,6 +100,8 @@ class SFNKTTrainer:
         self.tau_s = tau_s
         self.gradient_clip_norm = gradient_clip_norm
         self.wandb_logger = wandb_logger
+        self.cache_batch_size = cache_batch_size
+        self.cache_workers = cache_workers
 
         self.loss_bce_masked = nn.BCEWithLogitsLoss(reduction="none")
         self.loss_weighted_bce = CognitiveWeightedBCELoss(alpha=alpha)
@@ -104,6 +110,41 @@ class SFNKTTrainer:
 
         ensure_dir(self.checkpoint_dir)
         ensure_dir(self.h5_cache_path.parent)
+
+    def _clone_components_for_device(self, target_device: torch.device) -> Tuple[BaseLLMReasoner, nn.Module]:
+        """
+        Creates component replicas (llm_reasoner, qformer) isolated on a specific device
+        for multi-GPU parallel caching.
+        """
+        # 1. Clone Q-Former
+        qformer_clone = copy.deepcopy(self.model.qformer).to(target_device)
+        qformer_clone.eval()
+        for p in qformer_clone.parameters():
+            p.requires_grad = False
+
+        # 2. Clone LLM Reasoner
+        str_dev = str(target_device)
+        llm_current_dev = getattr(self.llm_reasoner, "device", None)
+        if llm_current_dev is not None and str(llm_current_dev) == str_dev:
+            llm_clone = self.llm_reasoner
+        elif hasattr(self.llm_reasoner, "model"):
+            from src.models.llm_reasoner import HuggingFaceReasoner
+            llm_clone = HuggingFaceReasoner(
+                model_name=self.llm_reasoner.model_name,
+                d_llm=self.llm_reasoner.d_llm,
+                max_tokens=self.llm_reasoner.max_tokens,
+                device=str_dev,
+                target_layer=self.llm_reasoner.target_layer,
+            )
+        elif hasattr(self.llm_reasoner, "encoder"):
+            llm_clone = copy.deepcopy(self.llm_reasoner)
+            llm_clone.device = target_device
+            if hasattr(llm_clone, "encoder"):
+                llm_clone.encoder.to(target_device)
+        else:
+            llm_clone = copy.deepcopy(self.llm_reasoner).to(target_device)
+
+        return llm_clone, qformer_clone
 
     # -------------------------------------------------------------------------
     # STAGE 1: Fast Backbone Independent Training
@@ -354,9 +395,36 @@ class SFNKTTrainer:
         train_loader: DataLoader,
         test_loader: Optional[DataLoader] = None,
         max_cache_samples: Optional[int] = None,
+        cache_batch_size: Optional[int] = None,
+        cache_workers: Optional[int] = None,
     ) -> Dict[str, Any]:
         logger.info("=== Starting Stage 2: SCDT Anomaly Scan & Q-Former Offline Caching ===")
         self.model.eval()
+
+        # Resolve batch size for caching: CLI arg > __init__ param > smart default
+        req_bs = cache_batch_size if cache_batch_size is not None else getattr(self, "cache_batch_size", None)
+        if req_bs is not None and req_bs > 0:
+            cache_chunk_size = req_bs
+        else:
+            is_hf_llm = hasattr(self.llm_reasoner, "model")
+            cache_chunk_size = 32 if is_hf_llm else (32 if "mps" in str(self.device).lower() else 64)
+
+        # Resolve workers for caching: CLI arg > __init__ param > hardware auto-detection
+        req_workers = cache_workers if cache_workers is not None else getattr(self, "cache_workers", None)
+        if req_workers is not None and req_workers > 0:
+            effective_workers = req_workers
+        else:
+            if torch.cuda.is_available() and torch.cuda.device_count() >= 2 and "cuda" in str(self.device).lower():
+                effective_workers = 2
+            else:
+                effective_workers = 1
+
+        logger.info(
+            "Stage 2 Caching Setup: batch_size=%d, num_workers=%d (Detected CUDA devices: %d)",
+            cache_chunk_size,
+            effective_workers,
+            torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        )
 
         # Step 2.1: Calibrate dynamic threshold tau* on Validation set
         logger.info("Step 2.1: Scanning Validation set to calibrate tau*...")
@@ -422,11 +490,7 @@ class SFNKTTrainer:
             qformer_optimizer = torch.optim.AdamW(
                 self.model.qformer.parameters(), lr=1e-3, weight_decay=1e-4
             )
-            is_hf_llm = hasattr(self.llm_reasoner, "model")
-            align_batch_size = min(
-                16 if is_hf_llm else (32 if "mps" in str(self.device).lower() else 64),
-                alignment_size,
-            )
+            align_batch_size = min(cache_chunk_size, alignment_size)
 
             # Step 2.2a: Pre-extract H_cot for the alignment subset with progress bar
             logger.info("Extracting H_cot representations for Q-Former alignment subset...")
@@ -558,38 +622,124 @@ class SFNKTTrainer:
             )
 
             if n_uncached > 0:
-                is_hf_llm = hasattr(self.llm_reasoner, "model")
-                cache_chunk_size = 16 if is_hf_llm else (32 if "mps" in str(self.device).lower() else 64)
-                pbar_cache = tqdm(
-                    range(0, n_uncached, cache_chunk_size),
-                    desc="Stage 2 [Step 2.3: Offline HDF5 Caching]",
-                    leave=True,
-                )
-                for start_idx in pbar_cache:
-                    chunk_events = uncached_events[start_idx : start_idx + cache_chunk_size]
-                    prompts = [self._build_prompt_for_event(e) for e in chunk_events]
-                    q_list = [e["qid"] for e in chunk_events]
-                    c_list = [e["cid"] for e in chunk_events]
-                    r_list = [e["response"] for e in chunk_events]
+                if effective_workers >= 2 and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+                    # Multi-GPU Parallel Caching Mode
+                    worker_count = min(effective_workers, torch.cuda.device_count())
+                    devices = [torch.device(f"cuda:{i}") for i in range(worker_count)]
+                    logger.info(
+                        "Launching Multi-GPU Parallel Caching across %d devices: %s (batch_size=%d, total_uncached=%d)",
+                        worker_count,
+                        [str(d) for d in devices],
+                        cache_chunk_size,
+                        n_uncached,
+                    )
 
-                    with torch.no_grad():
-                        h_cot = self.llm_reasoner.extract_hidden_states(
-                            prompts=prompts,
-                            question_ids=q_list,
-                            concept_ids=c_list,
-                            responses=r_list,
-                        )
-                        if h_cot.device != self.device:
-                            h_cot = h_cot.to(self.device)
-                        z_cog = self.model.qformer(h_cot)  # [chunk, M, d]
-                        z_np = z_cog.cpu().numpy().astype(np.float16)
+                    worker_events = [uncached_events[i::worker_count] for i in range(worker_count)]
+                    replicas = [self._clone_components_for_device(d) for d in devices]
+                    temp_h5_paths = [self.h5_cache_path.parent / f"_tmp_cache_worker_{i}.h5" for i in range(worker_count)]
 
-                    for idx_in_chunk, e in enumerate(chunk_events):
-                        key = f"{e['uid']}_{e['step']}"
-                        if key not in h5f:
-                            h5f.create_dataset(key, data=z_np[idx_in_chunk], dtype="float16")
+                    def _worker_cache_task(w_idx: int):
+                        w_dev = devices[w_idx]
+                        w_llm, w_qformer = replicas[w_idx]
+                        w_events = worker_events[w_idx]
+                        sub_path = temp_h5_paths[w_idx]
+                        if sub_path.exists():
+                            sub_path.unlink()
 
-                    pbar_cache.set_postfix({"cached": min(start_idx + cache_chunk_size, n_uncached)})
+                        n_w = len(w_events)
+                        with h5py.File(sub_path, "w") as sub_h5:
+                            pbar_w = tqdm(
+                                range(0, n_w, cache_chunk_size),
+                                desc=f"Stage 2 [GPU {w_idx} ({w_dev}): {n_w} triggers, bs={cache_chunk_size}]",
+                                leave=True,
+                                position=w_idx,
+                            )
+                            for start_idx in pbar_w:
+                                chunk_events = w_events[start_idx : start_idx + cache_chunk_size]
+                                prompts = [self._build_prompt_for_event(e) for e in chunk_events]
+                                q_list = [e["qid"] for e in chunk_events]
+                                c_list = [e["cid"] for e in chunk_events]
+                                r_list = [e["response"] for e in chunk_events]
+
+                                with torch.no_grad():
+                                    h_cot = w_llm.extract_hidden_states(
+                                        prompts=prompts,
+                                        question_ids=q_list,
+                                        concept_ids=c_list,
+                                        responses=r_list,
+                                    )
+                                    if h_cot.device != w_dev:
+                                        h_cot = h_cot.to(w_dev)
+                                    z_cog = w_qformer(h_cot)
+                                    z_np = z_cog.cpu().numpy().astype(np.float16)
+
+                                for idx_in_chunk, e in enumerate(chunk_events):
+                                    key = f"{e['uid']}_{e['step']}"
+                                    if key not in sub_h5:
+                                        sub_h5.create_dataset(key, data=z_np[idx_in_chunk], dtype="float16")
+
+                                pbar_w.set_postfix({"cached": min(start_idx + cache_chunk_size, n_w)})
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        futures = [executor.submit(_worker_cache_task, i) for i in range(worker_count)]
+                        for f in concurrent.futures.as_completed(futures):
+                            f.result()
+
+                    logger.info("Merging multi-GPU cache partitions into primary cache: %s...", self.h5_cache_path.name)
+                    for sub_p in temp_h5_paths:
+                        if sub_p.exists():
+                            with h5py.File(sub_p, "r") as sub_h5:
+                                for key in sub_h5.keys():
+                                    if key not in h5f:
+                                        h5f.create_dataset(key, data=sub_h5[key][:], dtype="float16")
+                            try:
+                                sub_p.unlink()
+                            except OSError:
+                                pass
+
+                    del replicas
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                else:
+                    # Single-Device (1 GPU CUDA, MPS, CPU) Mode
+                    target_dev = self.llm_device if hasattr(self, "llm_device") else self.device
+                    logger.info(
+                        "Running Single-Device Caching on %s (batch_size=%d, triggers=%d)...",
+                        target_dev,
+                        cache_chunk_size,
+                        n_uncached,
+                    )
+                    pbar_cache = tqdm(
+                        range(0, n_uncached, cache_chunk_size),
+                        desc=f"Stage 2 [Step 2.3: Offline Caching ({n_uncached} triggers, bs={cache_chunk_size})]",
+                        leave=True,
+                    )
+                    for start_idx in pbar_cache:
+                        chunk_events = uncached_events[start_idx : start_idx + cache_chunk_size]
+                        prompts = [self._build_prompt_for_event(e) for e in chunk_events]
+                        q_list = [e["qid"] for e in chunk_events]
+                        c_list = [e["cid"] for e in chunk_events]
+                        r_list = [e["response"] for e in chunk_events]
+
+                        with torch.no_grad():
+                            h_cot = self.llm_reasoner.extract_hidden_states(
+                                prompts=prompts,
+                                question_ids=q_list,
+                                concept_ids=c_list,
+                                responses=r_list,
+                            )
+                            if h_cot.device != self.device:
+                                h_cot = h_cot.to(self.device)
+                            z_cog = self.model.qformer(h_cot)  # [chunk, M, d]
+                            z_np = z_cog.cpu().numpy().astype(np.float16)
+
+                        for idx_in_chunk, e in enumerate(chunk_events):
+                            key = f"{e['uid']}_{e['step']}"
+                            if key not in h5f:
+                                h5f.create_dataset(key, data=z_np[idx_in_chunk], dtype="float16")
+
+                        pbar_cache.set_postfix({"cached": min(start_idx + cache_chunk_size, n_uncached)})
 
             total_stored = len(h5f.keys())
 

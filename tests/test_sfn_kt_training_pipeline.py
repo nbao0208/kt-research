@@ -178,4 +178,51 @@ class TestSFNKTTrainingPipeline:
         assert trainer_2gpu.device == torch.device("cuda:0")
         assert trainer_2gpu.llm_device == torch.device("cuda:1")
 
+    def test_cli_caching_arguments(self, monkeypatch):
+        import sys
+        from scripts.train_sfn_kt import parse_cli_args
+
+        test_argv = [
+            "train_sfn_kt.py",
+            "--cache-batch-size", "32",
+            "--cache-workers", "2",
+            "--llm-max-tokens", "64",
+            "--stage", "2",
+        ]
+        monkeypatch.setattr(sys, "argv", test_argv)
+        cli_args, _ = parse_cli_args()
+        assert cli_args.cache_batch_size == 32
+        assert cli_args.cache_workers == 2
+        assert cli_args.llm_max_tokens == 64
+        assert cli_args.stage == "2"
+
+    def test_clone_components_for_device(self):
+        model = SFNKTModel(
+            num_questions=10,
+            num_concepts=5,
+            d_model=16,
+            num_queries=2,
+            nheads=2,
+            nlayers=1,
+            dim_feedforward=32,
+            max_seq_len=10,
+            d_llm=32,
+        )
+        llm = MockReasoner(model_name="mock-test", d_llm=32, max_tokens=8)
+        scdt = CognitiveAnomalyRegulator()
+
+        trainer = SFNKTTrainer(
+            model=model,
+            llm_reasoner=llm,
+            scdt_regulator=scdt,
+            device=torch.device("cpu"),
+        )
+
+        cloned_llm, cloned_qformer = trainer._clone_components_for_device(torch.device("cpu"))
+        assert cloned_llm is not None
+        assert cloned_qformer is not None
+        for p in cloned_qformer.parameters():
+            assert not p.requires_grad
+
+
 
