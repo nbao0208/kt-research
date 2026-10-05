@@ -223,10 +223,6 @@ Output: `outputs/comparison/model_comparison.json`, `outputs/comparison/model_co
 
 SFN-KT (Selective Foundation-Neural Knowledge Tracing) is trained and evaluated on the large-scale **XES3G5M** dataset using a 3-stage decoupled pipeline.
 
-> [!NOTE]
-> Always execute commands using the Conda environment:
-> `conda run -n kt-research-env python <script>`
-
 #### 1. Preprocess & Validate XES3G5M Metadata
 
 Verify and cache split integrity (0 student UID overlap between train/val folds and held-out test), question metadata, KC route maps, and RoBERTa embeddings:
@@ -239,34 +235,104 @@ Output: `data/processed/xes3g5m/dataset_summary.json`
 
 #### 2. Train SFN-KT (3-Stage Decoupled Pipeline)
 
-You can train all stages end-to-end or run individual stages (`1`, `2`, `3`, or `all`). The LLM model name and backend can be passed directly from the terminal CLI:
+SFN-KT utilizes a decoupled 3-stage training pipeline designed for maximum efficiency:
+- **Stage 1**: Train Fast Causal Backbone and freeze base sensor $w_{\text{base}}$.
+- **Stage 2**: Scan anomalies via SCDT, generate pedagogical Chain-of-Thought (CoT) rationales via LLM (Ollama / Cloud APIs / Local HF), encode text into continuous representations via a frozen **Lightweight Text Encoder** (`sentence-transformers/all-MiniLM-L6-v2`), align Cognitive Q-Former, and store compressed memory tensors $\mathbf{Z}_t^{\text{cog}} \in \mathbb{R}^{M \times d}$ into an offline HDF5 cache.
+- **Stage 3**: Train Multi-Anchor Causal Adapter with Residual Highway and joint Soft-ECE calibration.
+
+##### Prerequisites & Configuration Setup Before Running
+
+Before executing training with an LLM backend, prepare the corresponding provider:
+
+| Provider / Backend | Prerequisites & Setup Steps | Default Endpoint | Example Command Flag |
+| :--- | :--- | :--- | :--- |
+| **`ollama`** (Local Free) | 1. Install Ollama: `brew install ollama`<br>2. Start daemon: `ollama serve`<br>3. Pull model: `ollama pull qwen2.5:7b` (or `deepseek-r1:8b`) | `http://localhost:11434` | `--llm-backend ollama --llm qwen2.5:7b` |
+| **`google` / `gemini`** | 1. Obtain free key from [Google AI Studio](https://aistudio.google.com/)<br>2. Set: `export GEMINI_API_KEY="AIzaSy..."` | Google AI Studio REST v1beta | `--llm-backend google --llm gemini-1.5-flash` |
+| **`deepseek` / `openai`** | 1. Obtain API key from DeepSeek / OpenAI / OpenRouter<br>2. Set: `export DEEPSEEK_API_KEY="..."` or `OPENAI_API_KEY` | `https://api.deepseek.com/v1` or OpenAI | `--llm-backend deepseek --llm deepseek-reasoner` |
+| **`mock`** (Offline CI/Dev) | No setup required. Uses XES3G5M RoBERTa embeddings or deterministic pseudo-tokens. | Local CPU/MPS/CUDA | `--llm-backend mock` |
+| **`huggingface`** | Requires local NVIDIA GPU with $\ge 24\text{GB}$ VRAM for models $\ge 7\text{B}$. | Local GPU | `--llm-backend huggingface --llm Qwen/Qwen2.5-Math-7B` |
+
+> **Lightweight Text Encoder**: When using API or Ollama backends, generated text rationales are converted into token-level representations using `sentence-transformers/all-MiniLM-L6-v2` ($d_{\text{enc}} = 384$). Weights are permanently frozen, avoiding catastrophic forgetting and heavy VRAM consumption.
+>
+> **Two-Tier Text Caching**: Specify `--text-cache-path` to save raw generated text rationales to a JSON file. Subsequent runs reuse cached text instantly, incurring zero additional API calls or latency.
+
+##### CLI Configuration Reference
+
+| CLI Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--experiment-name` | `str` | `sfn_kt_xes3g5m_default` | Unique experiment identifier (alias `--exp-name`). Isolates checkpoints (`outputs/artifacts/<exp_name>/`), HDF5 cache, text cache, and evaluation metrics (`outputs/metrics/<exp_name>/`). |
+| `--stage` | `str` | `all` | Training stage to execute: `1`, `2`, `3`, or `all`. |
+| `--llm-backend` | `str` | `mock` | LLM backend: `ollama`, `google`, `gemini`, `deepseek`, `openai`, `openrouter`, `huggingface`, `mock`. |
+| `--llm` | `str` | `Qwen/Qwen2.5-Math-7B` | LLM model name (e.g. `qwen2.5:7b`, `gemini-1.5-flash`, `deepseek-reasoner`). |
+| `--encoder-name` | `str` | `sentence-transformers/all-MiniLM-L6-v2` | Pre-trained text encoder used to encode CoT rationales. |
+| `--llm-d-llm` | `int` | `384` (for MiniLM) | Latent dimension fed into Cognitive Q-Former (MiniLM automatically projects if dimension differs). |
+| `--api-key` | `str` | `None` | API key (or read from environment: `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`). |
+| `--base-url` | `str` | `None` | Base URL override for Ollama (e.g. `http://localhost:11434`) or custom OpenAI proxies. |
+| `--text-cache-path`| `str` | Auto: `outputs/artifacts/<exp_name>/<backend>_text_cache.json` | Path to JSON file caching generated text rationales. If omitted, automatically isolated inside the experiment directory. |
+| `--device` | `str` | `auto` | Compute device: `auto`, `mps` (Apple Silicon), `cuda`, or `cpu`. |
+| `--batch-size` | `int` | `64` | Training batch size. |
+| `--epochs` | `int` | `None` | Override epoch count for all stages. |
+| `--max-triggers` | `int` | `None` | Maximum number of SCDT anomaly events to query LLM for (useful for strict API budgets). |
+| `--smoke-test` | `flag` | `False` | Run rapid 1-epoch sanity check with small sample size. |
+
+##### Example Commands
 
 ```bash
-# Run all stages end-to-end with Mock/RoBERTa reasoner (smoke test)
-conda run -n kt-research-env python scripts/train_sfn_kt.py --stage all --smoke-test
+# 1. Run full end-to-end pipeline with custom experiment name and Ollama:
+conda run -n kt-research-env python scripts/train_sfn_kt.py \
+    --experiment-name sfn_kt_qwen2_5_7b \
+    --stage all \
+    --llm-backend ollama \
+    --llm qwen2.5:7b \
+    --encoder-name sentence-transformers/all-MiniLM-L6-v2 \
+    --llm-d-llm 384 \
+    --device auto
 
-# Train Stage 1: Fast Causal Backbone
-conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 1 --epochs 20 --batch-size 64
+# 2. Run with Google AI Studio Gemini API (Ultra-fast cloud reasoning):
+export GEMINI_API_KEY="your-gemini-api-key"
+conda run -n kt-research-env python scripts/train_sfn_kt.py \
+    --stage all \
+    --llm-backend google \
+    --llm gemini-1.5-flash \
+    --encoder-name sentence-transformers/all-MiniLM-L6-v2 \
+    --llm-d-llm 384 \
+    --api-key $GEMINI_API_KEY \
+    --text-cache-path outputs/artifacts/sfn_kt_xes3g5m_default/gemini_text_cache.json \
+    --device auto
 
-# Train Stage 2: Selective Cognitive Dilemma Trigger (SCDT) scan & Cognitive Q-Former caching
-conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 2 \
-  --llm Qwen/Qwen2.5-Math-7B \
-  --llm-backend huggingface \
-  --llm-d-llm 3584
+# 3. Run with DeepSeek-R1 via OpenAI-compatible REST endpoint:
+export DEEPSEEK_API_KEY="your-deepseek-api-key"
+conda run -n kt-research-env python scripts/train_sfn_kt.py \
+    --stage all \
+    --llm-backend deepseek \
+    --llm deepseek-reasoner \
+    --encoder-name sentence-transformers/all-MiniLM-L6-v2 \
+    --llm-d-llm 384 \
+    --api-key $DEEPSEEK_API_KEY \
+    --text-cache-path outputs/artifacts/sfn_kt_xes3g5m_default/deepseek_text_cache.json
 
-# Alternatively with DeepSeek-R1 Distill or OpenAI API:
-conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 2 \
-  --llm deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-  --llm-backend huggingface \
-  --llm-d-llm 1536
+# 4. Run Stage 2 independently with strict trigger budget (e.g. top 500 anomalies):
+conda run -n kt-research-env python scripts/train_sfn_kt.py \
+    --stage 2 \
+    --llm-backend ollama \
+    --llm qwen2.5:7b \
+    --encoder-name sentence-transformers/all-MiniLM-L6-v2 \
+    --llm-d-llm 384 \
+    --max-triggers 500
 
-# Train Stage 3: Multi-Anchor Causal Adapter Warm-Up & Joint Calibration (Soft-ECE)
-conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 3 --epochs 15
+# 5. Rapid smoke test verifying the pipeline without external dependencies:
+conda run -n kt-research-env python scripts/train_sfn_kt.py \
+    --smoke-test \
+    --stage all \
+    --llm-backend ollama \
+    --encoder-name sentence-transformers/all-MiniLM-L6-v2 \
+    --llm-d-llm 384
 ```
 
 Artifacts generated:
 - Stage 1: `outputs/artifacts/{exp}/fast_backbone_best.pt`
 - Stage 2: `outputs/artifacts/{exp}/cognitive_qformer_cache.h5` (offline compressed HDF5 tensor cache)
+- Stage 2 text cache: `outputs/artifacts/{exp}/llm_text_cache.json` (raw generated CoT rationales)
 - Stage 3: `outputs/artifacts/{exp}/sfn_kt_best.pt`
 
 #### 3. Standalone SFN-KT Evaluation
@@ -406,6 +472,87 @@ Selective Foundation-Neural KT architecture designed for high throughput and dee
   - Soft-ECE Loss: Differentiable Expected Calibration Error using 10 soft Sigmoid bins to align predicted probabilities with empirical mastery.
 
 Reference: `docs/sfn-kt/model_arch.md`.
+
+### SFN-KT & XES3G5M (pyKT Benchmark Standard Pipeline)
+
+This project strictly implements and follows the **pyKT benchmark standards** (NeurIPS 2022) for the XES3G5M dataset:
+
+#### 1. pyKT Benchmark Protocol
+- **Dataset Partitioning (5-Fold CV)**:
+  - `train_valid_sequences.csv`: Folds 0, 1, 2, 3 are used for model training (14,453 students), and Fold 4 is used for validation.
+  - Zero student leakage: strictly enforced across all 5 folds.
+- **Official Test Split (`test_question_window_sequences.csv`)**:
+  - 3,613 withheld test students split into sliding windows of length 200.
+  - Exactly zero student UID overlap between training folds and test windows.
+  - Contains pyKT-specific tracking columns: `qidxs` (question interaction index), `rest` (remaining KCs in question), and `orirow` (original student sequence index).
+- **Question-Level Evaluation via Late Fusion**:
+  - In educational benchmarks where questions map to multiple Knowledge Components (KCs), models predict at the KC sequence level where `selectmasks == 1`.
+  - Predictions are aggregated across KCs sharing the same `(uid, qidx)` to form question-level predictions:
+    - **Late-Mean** (pyKT default): $\hat{y}_q = \frac{1}{|K_q|} \sum_{k \in K_q} \hat{y}_k$
+    - **Late-Vote**: Majority voting over binary KC decisions.
+    - **Late-All**: Product of probabilities ($\hat{y}_q = \prod_{k \in K_q} \hat{y}_k$).
+  - Evaluated against binary question ground-truth $y_q$ using AUC, Accuracy, LogLoss, and Brier score.
+
+#### 2. Workflow & Execution Guide
+
+> **Note**: All terminal commands must be executed using the Conda environment `kt-research-env`.
+
+##### A. Preprocessing & pyKT Dataset Profiling
+Inspects metadata, sequence lengths, verifies 0 student UID leakage, and validates pyKT schemas:
+```bash
+conda run -n kt-research-env python scripts/preprocess_xes3g5m.py
+```
+Outputs are saved to `data/processed/xes3g5m/dataset_summary.json` and `data/processed/xes3g5m/pykt_benchmark_info.json`.
+
+##### B. Verification & Compliance Tests
+Run the comprehensive test suite verifying late fusion, dataset loaders, and SFN-KT training:
+```bash
+conda run -n kt-research-env pytest tests/test_pykt_compliance.py tests/test_xes3g5m.py -v
+```
+
+##### C. Minimal End-to-End Smoke Test
+Verify the complete 3-stage training and late fusion evaluation pipeline locally without requiring a GPU or LLM API:
+```bash
+conda run -n kt-research-env python scripts/train_sfn_kt.py \
+    --smoke-test \
+    --stage all \
+    --llm-backend mock \
+    --device cpu
+```
+
+##### D. Full 3-Stage Training (pyKT Benchmark)
+Run the 3 decoupled stages sequentially or all together:
+```bash
+# Option 1: Run all 3 stages in one command on GPU
+conda run -n kt-research-env python scripts/train_sfn_kt.py \
+    --stage all \
+    --test-mode question_window \
+    --fusion-type mean \
+    --llm Qwen/Qwen2.5-Math-7B \
+    --llm-backend hf \
+    --device cuda
+
+# Option 2: Run stage-by-stage
+# Stage 1: Fast Backbone pretraining (invariant sensor freezing)
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 1 --device cuda --epochs 10
+
+# Stage 2: SCDT cognitive anomaly scan, Q-Former alignment & HDF5 tensor caching
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 2 --device cuda --llm Qwen/Qwen2.5-Math-7B --llm-backend hf
+
+# Stage 3: Multi-Anchor Causal Adapter training & Soft-ECE joint calibration
+conda run -n kt-research-env python scripts/train_sfn_kt.py --stage 3 --device cuda --epochs 10 --test-mode question_window --fusion-type mean
+```
+
+##### E. Standalone pyKT Evaluation
+Evaluate a saved SFN-KT checkpoint on the official pyKT question-level window test set with late fusion:
+```bash
+conda run -n kt-research-env python scripts/evaluate_sfn_kt.py \
+    --checkpoint-dir outputs/artifacts/sfn_kt/sfn_kt_xes3g5m_default \
+    --test-mode question_window \
+    --fusion-type mean \
+    --device cuda
+```
+The evaluator reports both KC-level metrics and Question-level Late Fusion metrics (Late-Mean, Late-Vote, Late-All), and saves prediction records to `test_eval_predictions.parquet`.
 
 ### Baselines
 

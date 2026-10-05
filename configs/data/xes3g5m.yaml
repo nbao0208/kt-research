@@ -3,12 +3,17 @@ raw_dir: data/raw/XES3G5M
 processed_dir: data/processed/xes3g5m
 kc_level_file: data/raw/XES3G5M/kc_level/train_valid_sequences.csv
 test_file: data/raw/XES3G5M/kc_level/test.csv
+test_window_file: data/raw/XES3G5M/kc_level/test_question_window_sequences.csv
 metadata_dir: data/raw/XES3G5M/metadata
 num_questions: 7652
 num_concepts: 1175
 max_seq_len: 200
 
-# 5-fold student-level partition
-train_folds: [0, 1, 2]
-val_fold: 3
+# pyKT Standard 5-fold cross-validation & evaluation settings:
+# In pyKT benchmark: folds 0-3 for train, fold 4 for validation.
+# Official question-level evaluation is done on test_question_window_sequences.csv.
+train_folds: [0, 1, 2, 3]
+val_fold: 4
 test_fold: 4
+test_mode: question_window  # Options: "question_window" (official pyKT test), "test_fold", "full_test"
+fusion_type: mean           # Late fusion strategy: "mean", "vote", "all"

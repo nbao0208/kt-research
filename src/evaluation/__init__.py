@@ -1,5 +1,9 @@
 from src.evaluation.bootstrap import bootstrap_auc, paired_bootstrap_difference
 from src.evaluation.evaluator import evaluate_held_out_block, evaluate_online_next_step
+from src.evaluation.late_fusion import (
+    compute_all_late_fusion_metrics,
+    compute_late_fusion_metrics,
+)
 from src.evaluation.metrics import compute_ece, compute_metrics, compute_skill_metrics
 from src.evaluation.plots import (
     generate_mermaid_comparison_chart,
@@ -15,6 +19,8 @@ __all__ = [
     "compute_metrics",
     "compute_skill_metrics",
     "compute_ece",
+    "compute_late_fusion_metrics",
+    "compute_all_late_fusion_metrics",
     "bootstrap_auc",
     "paired_bootstrap_difference",
     "evaluate_online_next_step",

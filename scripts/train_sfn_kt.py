@@ -23,17 +23,23 @@ logger = setup_logger(__name__)
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="Train SFN-KT model on XES3G5M benchmark.")
     parser.add_argument("--config-name", type=str, default="sfn_kt_xes3g5m", help="Experiment config file name.")
+    parser.add_argument("--experiment-name", "--exp-name", type=str, default=None, help="Custom experiment name to isolate artifacts, metrics, and checkpoints.")
     parser.add_argument("--stage", type=str, default="all", choices=["1", "2", "3", "all"], help="Training stage to execute.")
-    parser.add_argument("--llm", type=str, default=None, help="LLM model name/path (e.g. Qwen/Qwen2.5-Math-7B, mock).")
-    parser.add_argument("--llm-backend", type=str, default=None, choices=["mock", "huggingface", "hf", "vllm", "api"], help="LLM execution backend.")
-    parser.add_argument("--llm-d-llm", type=int, default=None, help="LLM hidden state dimension (e.g. 2048, 3584, 768).")
-    parser.add_argument("--api-key", type=str, default=None, help="API key for API backend (e.g. OpenAI/DeepSeek).")
-    parser.add_argument("--base-url", type=str, default=None, help="Base URL for OpenAI-compatible endpoint.")
+    parser.add_argument("--llm", type=str, default=None, help="LLM model name/path (e.g. Qwen/Qwen2.5-Math-7B, qwen2.5:7b, gemini-1.5-flash, mock).")
+    parser.add_argument("--llm-backend", type=str, default=None, choices=["mock", "huggingface", "hf", "vllm", "api", "ollama", "google", "gemini", "openai", "deepseek", "openrouter"], help="LLM execution backend.")
+    parser.add_argument("--llm-d-llm", type=int, default=None, help="LLM hidden state dimension (e.g. 384, 768, 2048, 3584).")
+    parser.add_argument("--encoder-name", type=str, default=None, help="Lightweight text encoder model name (default: sentence-transformers/all-MiniLM-L6-v2).")
+    parser.add_argument("--text-cache-path", type=str, default=None, help="File path to cache LLM generated text rationales (JSON).")
+    parser.add_argument("--api-key", type=str, default=None, help="API key for API backend (e.g. Google Gemini, OpenAI, DeepSeek).")
+    parser.add_argument("--base-url", type=str, default=None, help="Base URL for Ollama or OpenAI-compatible endpoint.")
     parser.add_argument("--device", type=str, default=None, help="Compute device (auto, cuda, mps, cpu).")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size override.")
     parser.add_argument("--epochs", type=int, default=None, help="Epochs override for all stages.")
     parser.add_argument("--max-samples", type=int, default=None, help="Max sequence samples to load (useful for debugging).")
     parser.add_argument("--max-triggers", type=int, default=None, help="Max anomaly triggers to extract/cache in Stage 2 (useful for debugging/resource constraints).")
+    parser.add_argument("--test-mode", type=str, default=None, choices=["question_window", "test_fold", "full_test"], help="Test split mode: question_window (pyKT standard), test_fold, or full_test.")
+    parser.add_argument("--fusion-type", type=str, default=None, choices=["mean", "vote", "all"], help="pyKT Late Fusion method for question-level evaluation.")
+    parser.add_argument("--test-file", type=str, default=None, help="Custom test sequences file path override.")
     parser.add_argument("--smoke-test", action="store_true", help="Run minimal smoke test (1 epoch, small sample).")
     return parser.parse_known_args()
 
@@ -66,6 +72,8 @@ def run_training():
 
 
     # Apply explicit CLI flags
+    if cli_args.experiment_name is not None:
+        cfg.experiment_name = cli_args.experiment_name
     if cli_args.llm is not None:
         cfg.model.llm.model_name = cli_args.llm
     if cli_args.llm_backend is not None:
@@ -73,6 +81,10 @@ def run_training():
     if cli_args.llm_d_llm is not None:
         cfg.model.llm.d_llm = cli_args.llm_d_llm
         cfg.model.d_llm = cli_args.llm_d_llm
+    if cli_args.encoder_name is not None:
+        cfg.model.llm.encoder_name = cli_args.encoder_name
+    if cli_args.text_cache_path is not None:
+        cfg.model.llm.text_cache_path = cli_args.text_cache_path
     if cli_args.api_key is not None:
         cfg.model.llm.api_key = cli_args.api_key
     if cli_args.base_url is not None:
@@ -112,6 +124,10 @@ def run_training():
     ensure_dir(artifacts_dir)
     ensure_dir(metrics_dir)
 
+    # Auto-route text cache path into artifacts_dir if not explicitly set
+    if cfg.model.llm.get("text_cache_path") is None:
+        cfg.model.llm.text_cache_path = str(artifacts_dir / f"{cfg.model.llm.backend}_text_cache.json")
+
     OmegaConf.save(config=cfg, f=artifacts_dir / "resolved_config.yaml")
 
     # Initialize WandB if enabled
@@ -146,13 +162,34 @@ def run_training():
         num_concepts=data_cfg.num_concepts,
         max_samples=cli_args.max_samples // 4 if cli_args.max_samples else None,
     )
+    test_mode = cli_args.test_mode or getattr(data_cfg, "test_mode", "question_window")
+    fusion_type = cli_args.fusion_type or getattr(data_cfg, "fusion_type", "mean")
+
+    if cli_args.test_file:
+        test_file = Path(cli_args.test_file)
+        test_folds = [data_cfg.test_fold] if "train_valid" in test_file.name else None
+    elif test_mode == "question_window":
+        test_file = Path(getattr(data_cfg, "test_window_file", "data/raw/XES3G5M/kc_level/test_question_window_sequences.csv"))
+        test_folds = None
+    elif test_mode == "full_test":
+        test_file = Path(getattr(data_cfg, "test_file", "data/raw/XES3G5M/kc_level/test.csv"))
+        test_folds = None
+    else:  # test_fold
+        test_file = Path(data_cfg.kc_level_file)
+        test_folds = [data_cfg.test_fold]
+
+    test_max_samples = cli_args.max_samples // 4 if cli_args.max_samples else None
+    logger.info(
+        "Loading Test dataset (mode=%s, file=%s, folds=%s, max_samples=%s)...",
+        test_mode, test_file.name, test_folds, test_max_samples
+    )
     test_dataset = XES3G5MDataset(
-        data_file=data_cfg.kc_level_file,
-        folds=[data_cfg.test_fold],
+        data_file=test_file,
+        folds=test_folds,
         max_seq_len=data_cfg.max_seq_len,
         num_questions=data_cfg.num_questions,
         num_concepts=data_cfg.num_concepts,
-        max_samples=cli_args.max_samples // 4 if cli_args.max_samples else None,
+        max_samples=test_max_samples,
     )
 
     batch_size = cfg.trainer.batch_size
@@ -275,7 +312,7 @@ def run_training():
         logger.info("Stage 3 completed. Best SFN-KT AUC: %.4f", stage3_res["best_sfn_kt_auc"])
 
     # 4. Evaluation on Test Set
-    logger.info("Running final evaluation on Test Set (fold %d)...", data_cfg.test_fold)
+    logger.info("Running final evaluation on Test Set (mode=%s, file=%s)...", test_mode, test_file.name)
     best_sfn_ckpt = artifacts_dir / "sfn_kt_best.pt"
     if best_sfn_ckpt.exists():
         ckpt = torch.load(best_sfn_ckpt, map_location=device)
@@ -286,6 +323,7 @@ def run_training():
     test_metrics = trainer.evaluate(
         test_loader,
         save_predictions_path=test_preds_path,
+        fusion_type=fusion_type,
     )
 
     logger.info("\n================ SFN-KT EVALUATION REPORT ================")
@@ -297,6 +335,17 @@ def run_training():
         logger.info("  Active Region Calibrated AUC: %.4f", test_metrics["active_region"].get("auc", 0.0))
     if test_metrics.get("inactive_region"):
         logger.info("  Inactive Region Calibrated AUC: %.4f", test_metrics["inactive_region"].get("auc", 0.0))
+    if "question_level" in test_metrics:
+        ql = test_metrics["question_level"]
+        logger.info("---------------------------------------------------------")
+        logger.info("  pyKT QUESTION-LEVEL (LATE FUSION) METRICS [%s]:", ql["calibrated"].get("fusion_type", "mean").upper())
+        logger.info("  Base Question AUC       : %.4f | ACC: %.4f", ql["base"]["auc"], ql["base"]["accuracy"])
+        logger.info("  SFN-KT Question AUC     : %.4f | ACC: %.4f", ql["calibrated"]["auc"], ql["calibrated"]["accuracy"])
+        logger.info("  Question AUC Gain       : %+.4f", ql["gain_auc"])
+        logger.info("  Num Questions Evaluated : %d (over %d KCs)", ql["calibrated"].get("num_questions", 0), ql["calibrated"].get("num_kcs", 0))
+        if "fusion_variants" in ql:
+            for variant_name, variant_metrics in ql["fusion_variants"].items():
+                logger.info("    * Variant %-10s : AUC = %.4f | ACC = %.4f", variant_name, variant_metrics.get("auc", 0.0), variant_metrics.get("accuracy", 0.0))
     logger.info("=========================================================\n")
 
     # Save metrics summary
@@ -306,11 +355,16 @@ def run_training():
     logger.info("Saved evaluation metrics to: %s", metrics_summary_file)
 
     if wandb_logger and wandb_enabled:
-        wandb_logger.log_summary({
+        summary_dict = {
             "test/base_auc": test_metrics["base"]["auc"],
             "test/sfn_kt_auc": test_metrics["calibrated"]["auc"],
             "test/gain_auc": test_metrics["gain_auc"],
-        })
+        }
+        if "question_level" in test_metrics:
+            summary_dict["test/question_base_auc"] = test_metrics["question_level"]["base"]["auc"]
+            summary_dict["test/question_sfn_kt_auc"] = test_metrics["question_level"]["calibrated"]["auc"]
+            summary_dict["test/question_gain_auc"] = test_metrics["question_level"]["gain_auc"]
+        wandb_logger.log_summary(summary_dict)
         wandb_logger.finish()
 
     logger.info("Training and evaluation finished successfully.")

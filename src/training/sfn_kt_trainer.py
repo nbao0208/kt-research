@@ -10,6 +10,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.evaluation.late_fusion import (
+    compute_all_late_fusion_metrics,
+    compute_late_fusion_metrics,
+)
 from src.evaluation.metrics import compute_metrics
 from src.models.llm_reasoner import BaseLLMReasoner, PedagogicalPromptBuilder
 from src.models.sfn_kt import (
@@ -236,11 +240,13 @@ class SFNKTTrainer:
         self,
         loader: DataLoader,
         max_samples: Optional[int] = None,
+        desc: str = "Scanning SCDT Anomaly Triggers",
     ) -> List[Dict[str, Any]]:
         """Collects interactions where SCDT anomaly score S_t > tau*."""
         triggered_events = []
+        pbar = tqdm(loader, desc=desc, leave=False)
         with torch.no_grad():
-            for batch in loader:
+            for batch in pbar:
                 q_ids = batch["questions"].to(self.device)
                 c_ids = batch["concepts"].to(self.device)
                 responses = batch["responses"].to(self.device)
@@ -257,38 +263,59 @@ class SFNKTTrainer:
                 )
                 trigger_mask = self.scdt.get_trigger_mask(scores, eval_mask)  # [B, T-1]
 
-                B, T_minus_1 = trigger_mask.shape
-                for b in range(B):
+                # Transfer batch tensors to CPU / NumPy once to eliminate GPU synchronization stalls
+                trigger_mask_cpu = trigger_mask.cpu().numpy()
+                if not trigger_mask_cpu.any():
+                    continue
+
+                q_ids_cpu = q_ids.cpu().numpy()
+                c_ids_cpu = c_ids.cpu().numpy()
+                targets_cpu = targets.cpu().numpy()
+                responses_cpu = responses.cpu().numpy()
+                padding_mask_cpu = padding_mask.cpu().numpy()
+
+                b_idxs, t_idxs = np.where(trigger_mask_cpu)
+                get_kc_name = self.metadata.get_kc_name_from_encoded_id if self.metadata else None
+
+                for b, t in zip(b_idxs, t_idxs):
                     uid = int(uids[b])
-                    for t in range(T_minus_1):
-                        if trigger_mask[b, t].item():
-                            actual_t = t + 1  # 1-indexed in sequence
-                            q_val = int(q_ids[b, actual_t].item())
-                            c_val = int(c_ids[b, actual_t].item())
-                            r_val = int(targets[b, t].item())
+                    actual_t = int(t + 1)
+                    q_val = int(q_ids_cpu[b, actual_t])
+                    c_val = int(c_ids_cpu[b, actual_t])
+                    r_val = int(targets_cpu[b, t])
 
-                            # Extract prior trajectory strictly 0 to t-1
-                            prior_hist = []
-                            for prev in range(actual_t):
-                                if not padding_mask[b, prev].item():
-                                    prev_q = int(q_ids[b, prev].item())
-                                    prev_c = int(c_ids[b, prev].item())
-                                    c_name = self.metadata.get_kc_name_from_encoded_id(prev_c) if self.metadata else f"Concept_{prev_c}"
-                                    prior_hist.append({
-                                        "question_id": prev_q,
-                                        "concept_name": c_name,
-                                        "correctness": int(responses[b, prev].item()),
-                                    })
+                    # Fast vectorized slice for prior trajectory without per-element GPU sync
+                    valid_mask_prev = ~padding_mask_cpu[b, :actual_t]
+                    if valid_mask_prev.any():
+                        valid_prev_indices = np.where(valid_mask_prev)[0]
+                        prev_qs = q_ids_cpu[b, valid_prev_indices]
+                        prev_cs = c_ids_cpu[b, valid_prev_indices]
+                        prev_rs = responses_cpu[b, valid_prev_indices]
 
-                            triggered_events.append({
-                                "uid": uid,
-                                "step": actual_t,
-                                "qid": q_val,
-                                "cid": c_val,
-                                "response": r_val,
-                                "prior_history": prior_hist,
-                            })
+                        prior_hist = [
+                            {
+                                "question_id": int(pq),
+                                "concept_name": get_kc_name(int(pc)) if get_kc_name else f"Concept_{pc}",
+                                "correctness": int(pr),
+                            }
+                            for pq, pc, pr in zip(prev_qs, prev_cs, prev_rs)
+                        ]
+                    else:
+                        prior_hist = []
 
+                    triggered_events.append({
+                        "uid": uid,
+                        "step": actual_t,
+                        "qid": q_val,
+                        "cid": c_val,
+                        "response": r_val,
+                        "prior_history": prior_hist,
+                    })
+
+                    if max_samples and len(triggered_events) >= max_samples:
+                        break
+
+                pbar.set_postfix({"triggers": len(triggered_events)})
                 if max_samples and len(triggered_events) >= max_samples:
                     triggered_events = triggered_events[:max_samples]
                     break
@@ -336,7 +363,7 @@ class SFNKTTrainer:
         val_scores = []
         val_masks = []
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc="Stage 2 [Step 2.1: Calibrating tau* on Val]", leave=False):
                 q_ids = batch["questions"].to(self.device)
                 c_ids = batch["concepts"].to(self.device)
                 responses = batch["responses"].to(self.device)
@@ -359,18 +386,35 @@ class SFNKTTrainer:
 
         # Step 2.2: Identify triggered interactions on training set & align Cognitive Q-Former
         logger.info("Step 2.2: Identifying triggers on Train set and aligning Cognitive Q-Former...")
-        train_triggered_events = self._collect_triggered_events(train_loader, max_samples=max_cache_samples)
+        train_triggered_events = self._collect_triggered_events(
+            train_loader,
+            max_samples=max_cache_samples,
+            desc="Stage 2 [Step 2.2: Scanning Train Triggers]",
+        )
         total_train_triggers = len(train_triggered_events)
         logger.info("Total Train anomaly triggers detected: %d", total_train_triggers)
 
         # Train Q-Former on representative alignment triggers as specified in model_arch.md
-        # ("tối ưu hóa Q-Former thông qua hai đầu dò phụ siêu nhẹ trong vài nghìn bước đầu: khoảng 15 đến 25 phút")
-        alignment_size = min(total_train_triggers, getattr(self, "stage2_max_alignment_samples", 2000))
+        # If max_cache_samples is constrained (e.g. testing or API budget), scale alignment size
+        max_align_allowed = getattr(self, "stage2_max_alignment_samples", 2000)
+        if max_cache_samples is not None:
+            max_align_allowed = min(max_align_allowed, max_cache_samples)
+        alignment_size = min(total_train_triggers, max_align_allowed)
         alignment_events = train_triggered_events[:alignment_size]
         logger.info(
             "Selected %d representative triggers for Cognitive Q-Former semantic alignment.",
             alignment_size,
         )
+
+        provider_name = getattr(self.llm_reasoner, "provider", "llm")
+        if max_cache_samples is None and provider_name in ["ollama", "google", "gemini", "openai", "deepseek"]:
+            logger.warning(
+                "[SFN-KT Advisory]: Running Stage 2 without '--max-triggers' will extract CoT for %d alignment prompts "
+                "plus all detected triggers via '%s'. On local Ollama 7B (~5-8s/prompt), this requires several hours. "
+                "TIP: For rapid experimentation or local testing, use '--max-triggers 100' or '--max-triggers 500'.",
+                alignment_size,
+                provider_name,
+            )
 
         cached_alignment_tensors = {}
 
@@ -390,7 +434,7 @@ class SFNKTTrainer:
             pbar_cot = tqdm(
                 range(0, alignment_size, align_batch_size),
                 desc="Stage 2 [Step 2.2: Extracting CoT for Alignment]",
-                leave=False,
+                leave=True,
             )
             for s_idx in pbar_cot:
                 chunk = alignment_events[s_idx : s_idx + align_batch_size]
@@ -593,6 +637,7 @@ class SFNKTTrainer:
 
         # Open HDF5 cache for fast read
         h5_cache = h5py.File(self.h5_cache_path, "r") if self.h5_cache_path.exists() else None
+        h5_keys_set = set(h5_cache.keys()) if h5_cache is not None else set()
 
         for epoch in range(1, self.stage3_epochs + 1):
             if epoch == self.warmup_epochs + 1:
@@ -625,12 +670,12 @@ class SFNKTTrainer:
                 z_memory = torch.zeros((B, T, M, d), dtype=torch.float32, device=self.device)
                 trigger_mask = torch.zeros((B, T), dtype=torch.bool, device=self.device)
 
-                if h5_cache is not None:
+                if h5_cache is not None and h5_keys_set:
                     for b in range(B):
                         uid = int(uids[b])
                         for t in range(T):
                             key = f"{uid}_{t}"
-                            if key in h5_cache:
+                            if key in h5_keys_set:
                                 z_memory[b, t] = torch.tensor(
                                     h5_cache[key][:], dtype=torch.float32, device=self.device
                                 )
@@ -706,16 +751,19 @@ class SFNKTTrainer:
         loader: DataLoader,
         h5_cache: Optional[Any] = None,
         save_predictions_path: Optional[Path] = None,
+        fusion_type: str = "mean",
     ) -> Dict[str, Any]:
         """
         Comprehensive evaluation comparing Base Fast Core vs Calibrated SFN-KT.
-        Reports global metrics, active vs inactive breakdown, and calibration.
+        Reports global KC-level metrics, active vs inactive breakdown, calibration,
+        and pyKT-compliant Question-Level Late Fusion metrics when question indices are available.
         """
         self.model.eval()
         close_cache_at_end = False
         if h5_cache is None and self.h5_cache_path.exists():
             h5_cache = h5py.File(self.h5_cache_path, "r")
             close_cache_at_end = True
+        h5_keys_set = set(h5_cache.keys()) if h5_cache is not None else set()
 
         all_base_preds = []
         all_calibrated_preds = []
@@ -723,6 +771,7 @@ class SFNKTTrainer:
         all_active_flags = []
         all_uids = []
         all_qids = []
+        all_qidxs = []
 
         for batch in loader:
             q_ids = batch["questions"].to(self.device)
@@ -739,12 +788,12 @@ class SFNKTTrainer:
             z_memory = torch.zeros((B, T, M, d), dtype=torch.float32, device=self.device)
             trigger_mask = torch.zeros((B, T), dtype=torch.bool, device=self.device)
 
-            if h5_cache is not None:
+            if h5_cache is not None and h5_keys_set:
                 for b in range(B):
                     uid = int(uids[b])
                     for t in range(T):
                         key = f"{uid}_{t}"
-                        if key in h5_cache:
+                        if key in h5_keys_set:
                             z_memory[b, t] = torch.tensor(
                                 h5_cache[key][:], dtype=torch.float32, device=self.device
                             )
@@ -763,6 +812,8 @@ class SFNKTTrainer:
 
             has_prior_trigger = (torch.cumsum(trigger_mask.float(), dim=1) > 0)[:, :-1]
 
+            eval_mask_np = eval_mask.cpu().numpy()
+
             # Flatten valid entries
             p_base_valid = p_base[eval_mask].cpu().numpy()
             p_cal_valid = p_calibrated[eval_mask].cpu().numpy()
@@ -774,6 +825,22 @@ class SFNKTTrainer:
             all_targets.extend(y_valid)
             all_active_flags.extend(active_valid)
 
+            # Extract user IDs for valid positions
+            uid_grid = np.repeat(uids[:, None], T - 1, axis=1)
+            all_uids.extend(uid_grid[eval_mask_np])
+
+            # Extract question IDs
+            q_ids_eval = q_ids[:, 1:].cpu().numpy()
+            all_qids.extend(q_ids_eval[eval_mask_np])
+
+            # Extract question index (for pyKT late fusion) if available
+            if "qidxs" in batch:
+                qidxs_eval = batch["qidxs"][:, 1:].cpu().numpy()
+                all_qidxs.extend(qidxs_eval[eval_mask_np])
+            else:
+                # Fallback to question IDs if qidxs not explicitly present
+                all_qidxs.extend(q_ids_eval[eval_mask_np])
+
         if close_cache_at_end and h5_cache is not None:
             h5_cache.close()
 
@@ -781,6 +848,8 @@ class SFNKTTrainer:
         y_base = np.array(all_base_preds)
         y_cal = np.array(all_calibrated_preds)
         active_arr = np.array(all_active_flags)
+        uids_arr = np.array(all_uids) if len(all_uids) > 0 else None
+        qidxs_arr = np.array(all_qidxs) if len(all_qidxs) > 0 else None
 
         base_metrics = compute_metrics(y_true, y_base)
         calibrated_metrics = compute_metrics(y_true, y_cal)
@@ -799,14 +868,40 @@ class SFNKTTrainer:
             "active_sample_ratio": round(float(active_mask.mean()), 4) if len(active_mask) > 0 else 0.0,
         }
 
+        # Question-level Late Fusion metrics (pyKT standard)
+        if qidxs_arr is not None and len(qidxs_arr) > 0:
+            question_base = compute_late_fusion_metrics(
+                y_base, y_true, qidxs=qidxs_arr, uids=uids_arr, fusion_type=fusion_type
+            )
+            question_calibrated = compute_late_fusion_metrics(
+                y_cal, y_true, qidxs=qidxs_arr, uids=uids_arr, fusion_type=fusion_type
+            )
+            fusion_variants = compute_all_late_fusion_metrics(
+                y_cal, y_true, qidxs=qidxs_arr, uids=uids_arr
+            )
+            results["question_level"] = {
+                "base": question_base,
+                "calibrated": question_calibrated,
+                "gain_auc": round(question_calibrated.get("auc", 0.0) - question_base.get("auc", 0.0), 6),
+                "fusion_variants": fusion_variants,
+            }
+
         if save_predictions_path:
             ensure_dir(save_predictions_path.parent)
-            df_preds = pd.DataFrame({
+            df_dict = {
                 "y_true": y_true,
                 "p_base": y_base,
                 "p_calibrated": y_cal,
                 "has_prior_trigger": active_arr,
-            })
+            }
+            if uids_arr is not None and len(uids_arr) == len(y_true):
+                df_dict["uid"] = uids_arr
+            if len(all_qids) == len(y_true):
+                df_dict["question_id"] = np.array(all_qids)
+            if qidxs_arr is not None and len(qidxs_arr) == len(y_true):
+                df_dict["qidx"] = qidxs_arr
+
+            df_preds = pd.DataFrame(df_dict)
             df_preds.to_parquet(save_predictions_path, index=False)
             logger.info("Saved prediction records to: %s", save_predictions_path)
 

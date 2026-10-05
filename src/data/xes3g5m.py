@@ -1,5 +1,6 @@
 import json
 import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -129,6 +130,7 @@ class XES3G5MMetadata:
         raw_qid = int_qid - 1
         return self.get_question_info(raw_qid)
 
+    @lru_cache(maxsize=4096)
     def get_kc_name_from_encoded_id(self, encoded_cid: Union[int, str]) -> str:
         """
         Safely retrieve concept name from 1-based encoded dataset ID.
@@ -206,7 +208,12 @@ class XES3G5MDataset(Dataset):
         )
 
     def _load_and_filter(self, max_samples: Optional[int] = None) -> List[Dict[str, np.ndarray]]:
-        df = pd.read_csv(self.data_file)
+        # Optimize loading: if max_samples is specified and no fold filtering is needed (e.g. test files),
+        # use nrows parameter to avoid reading multi-gigabyte files entirely.
+        if max_samples is not None and (self.folds is None or "test" in self.data_file.name.lower()):
+            df = pd.read_csv(self.data_file, nrows=max_samples)
+        else:
+            df = pd.read_csv(self.data_file)
 
         # Filter by fold if specified
         if self.folds is not None and "fold" in df.columns:
@@ -224,6 +231,18 @@ class XES3G5MDataset(Dataset):
             s_arr = np.fromstring(row["selectmasks"], sep=",", dtype=np.int64) if "selectmasks" in row and pd.notna(row["selectmasks"]) else np.ones_like(q_arr)
             rep_arr = np.fromstring(row["is_repeat"], sep=",", dtype=np.int64) if "is_repeat" in row and pd.notna(row["is_repeat"]) else np.zeros_like(q_arr)
 
+            has_qidxs = "qidxs" in row and pd.notna(row["qidxs"])
+            qidx_arr = np.fromstring(row["qidxs"], sep=",", dtype=np.int64) if has_qidxs else None
+
+            has_rest = "rest" in row and pd.notna(row["rest"])
+            rest_arr = np.fromstring(row["rest"], sep=",", dtype=np.int64) if has_rest else None
+
+            has_orirow = "orirow" in row and pd.notna(row["orirow"])
+            orirow_arr = np.fromstring(str(row["orirow"]), sep=",", dtype=np.int64) if has_orirow else None
+
+            has_cidxs = "cidxs" in row and pd.notna(row["cidxs"])
+            cidx_arr = np.fromstring(row["cidxs"], sep=",", dtype=np.int64) if has_cidxs else None
+
             # Slicing or padding to fixed max_seq_len
             length = len(q_arr)
             if length > self.max_seq_len:
@@ -233,6 +252,14 @@ class XES3G5MDataset(Dataset):
                 t_arr = t_arr[:self.max_seq_len]
                 s_arr = s_arr[:self.max_seq_len]
                 rep_arr = rep_arr[:self.max_seq_len]
+                if qidx_arr is not None:
+                    qidx_arr = qidx_arr[:self.max_seq_len]
+                if rest_arr is not None:
+                    rest_arr = rest_arr[:self.max_seq_len]
+                if orirow_arr is not None:
+                    orirow_arr = orirow_arr[:self.max_seq_len]
+                if cidx_arr is not None:
+                    cidx_arr = cidx_arr[:self.max_seq_len]
             elif length < self.max_seq_len:
                 pad_len = self.max_seq_len - length
                 q_arr = np.pad(q_arr, (0, pad_len), constant_values=-1)
@@ -241,6 +268,14 @@ class XES3G5MDataset(Dataset):
                 t_arr = np.pad(t_arr, (0, pad_len), constant_values=-1)
                 s_arr = np.pad(s_arr, (0, pad_len), constant_values=-1)
                 rep_arr = np.pad(rep_arr, (0, pad_len), constant_values=-1)
+                if qidx_arr is not None:
+                    qidx_arr = np.pad(qidx_arr, (0, pad_len), constant_values=-1)
+                if rest_arr is not None:
+                    rest_arr = np.pad(rest_arr, (0, pad_len), constant_values=-1)
+                if orirow_arr is not None:
+                    orirow_arr = np.pad(orirow_arr, (0, pad_len), constant_values=-1)
+                if cidx_arr is not None:
+                    cidx_arr = np.pad(cidx_arr, (0, pad_len), constant_values=-1)
 
             # Valid interaction mask: elements where question != -1
             mask = (q_arr != -1)
@@ -259,7 +294,7 @@ class XES3G5MDataset(Dataset):
                 diffs = np.maximum(diffs, 0)
                 time_gaps[valid_idx] = np.log1p(diffs.astype(np.float32))
 
-            parsed_records.append({
+            rec = {
                 "uid": int(row.get("uid", idx)),
                 "fold": int(row.get("fold", -1)),
                 "questions": q_encoded,
@@ -271,7 +306,17 @@ class XES3G5MDataset(Dataset):
                 "time_gaps": time_gaps,
                 "is_repeat": rep_arr,
                 "mask": mask,
-            })
+            }
+            if qidx_arr is not None:
+                rec["qidxs"] = qidx_arr
+            if rest_arr is not None:
+                rec["rest"] = rest_arr
+            if orirow_arr is not None:
+                rec["orirow"] = orirow_arr
+            if cidx_arr is not None:
+                rec["cidxs"] = cidx_arr
+
+            parsed_records.append(rec)
 
         return parsed_records
 
@@ -280,7 +325,7 @@ class XES3G5MDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         rec = self.sequences[idx]
-        return {
+        item_dict = {
             "uid": torch.tensor(rec["uid"], dtype=torch.long),
             "fold": torch.tensor(rec["fold"], dtype=torch.long),
             "questions": torch.from_numpy(rec["questions"]).long(),
@@ -293,6 +338,15 @@ class XES3G5MDataset(Dataset):
             "is_repeat": torch.from_numpy(rec["is_repeat"]).long(),
             "mask": torch.from_numpy(rec["mask"]).bool(),
         }
+        if "qidxs" in rec:
+            item_dict["qidxs"] = torch.from_numpy(rec["qidxs"]).long()
+        if "rest" in rec:
+            item_dict["rest"] = torch.from_numpy(rec["rest"]).long()
+        if "orirow" in rec:
+            item_dict["orirow"] = torch.from_numpy(rec["orirow"]).long()
+        if "cidxs" in rec:
+            item_dict["cidxs"] = torch.from_numpy(rec["cidxs"]).long()
+        return item_dict
 
 
 class XES3G5MQuestionLevelDataset(XES3G5MDataset):
@@ -340,9 +394,11 @@ class XES3G5MQuestionLevelDataset(XES3G5MDataset):
             r_arr = r_arr[:min_len]
             t_arr = t_arr[:min_len]
 
-            # In question level, each interaction represents a unique question step
-            s_arr = np.ones_like(q_arr)
-            rep_arr = np.zeros_like(q_arr)
+            s_arr = np.fromstring(row["selectmasks"], sep=",", dtype=np.int64) if "selectmasks" in row and pd.notna(row["selectmasks"]) else np.ones_like(q_arr)
+            rep_arr = np.fromstring(row["is_repeat"], sep=",", dtype=np.int64) if "is_repeat" in row and pd.notna(row["is_repeat"]) else np.zeros_like(q_arr)
+
+            has_qidxs = "qidxs" in row and pd.notna(row["qidxs"])
+            qidx_arr = np.fromstring(row["qidxs"], sep=",", dtype=np.int64) if has_qidxs else None
 
             # Slicing or padding
             length = len(q_arr)
@@ -353,6 +409,8 @@ class XES3G5MQuestionLevelDataset(XES3G5MDataset):
                 t_arr = t_arr[:self.max_seq_len]
                 s_arr = s_arr[:self.max_seq_len]
                 rep_arr = rep_arr[:self.max_seq_len]
+                if qidx_arr is not None:
+                    qidx_arr = qidx_arr[:self.max_seq_len]
             elif length < self.max_seq_len:
                 pad_len = self.max_seq_len - length
                 q_arr = np.pad(q_arr, (0, pad_len), constant_values=-1)
@@ -361,6 +419,8 @@ class XES3G5MQuestionLevelDataset(XES3G5MDataset):
                 t_arr = np.pad(t_arr, (0, pad_len), constant_values=-1)
                 s_arr = np.pad(s_arr, (0, pad_len), constant_values=-1)
                 rep_arr = np.pad(rep_arr, (0, pad_len), constant_values=-1)
+                if qidx_arr is not None:
+                    qidx_arr = np.pad(qidx_arr, (0, pad_len), constant_values=-1)
 
             mask = (q_arr != -1)
             q_encoded = np.where(q_arr != -1, q_arr + 1, 0)
@@ -375,7 +435,7 @@ class XES3G5MQuestionLevelDataset(XES3G5MDataset):
                 diffs = np.maximum(diffs, 0)
                 time_gaps[valid_idx] = np.log1p(diffs.astype(np.float32))
 
-            parsed_records.append({
+            rec = {
                 "uid": int(row.get("uid", idx)),
                 "fold": int(row.get("fold", -1)),
                 "questions": q_encoded,
@@ -387,7 +447,11 @@ class XES3G5MQuestionLevelDataset(XES3G5MDataset):
                 "time_gaps": time_gaps,
                 "is_repeat": rep_arr,
                 "mask": mask,
-            })
+            }
+            if qidx_arr is not None:
+                rec["qidxs"] = qidx_arr
+
+            parsed_records.append(rec)
 
         return parsed_records
 
@@ -408,4 +472,12 @@ def collate_xes3g5m_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
     }
     if "time_gaps" in batch[0]:
         res["time_gaps"] = torch.stack([item["time_gaps"] for item in batch])
+    if "qidxs" in batch[0]:
+        res["qidxs"] = torch.stack([item["qidxs"] for item in batch])
+    if "rest" in batch[0]:
+        res["rest"] = torch.stack([item["rest"] for item in batch])
+    if "orirow" in batch[0]:
+        res["orirow"] = torch.stack([item["orirow"] for item in batch])
+    if "cidxs" in batch[0]:
+        res["cidxs"] = torch.stack([item["cidxs"] for item in batch])
     return res

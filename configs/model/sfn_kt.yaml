@@ -25,12 +25,15 @@ loss:
 
 # Foundation Model Reasoning Core (LLM)
 llm:
-  backend: mock # Options: 'mock', 'huggingface', 'vllm', 'api'
-  model_name: Qwen/Qwen2.5-Math-7B # e.g. 'Qwen/Qwen2.5-Math-7B', 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B'
-  d_llm: 2048
-  max_tokens: 32
+  backend: mock # Options: 'mock', 'ollama', 'google', 'gemini', 'api', 'openai', 'deepseek', 'huggingface', 'vllm'
+  model_name: Qwen/Qwen2.5-Math-7B # e.g. 'qwen2.5:7b' (ollama), 'gemini-1.5-flash' (google), 'Qwen/Qwen2.5-Math-7B' (hf)
+  encoder_name: sentence-transformers/all-MiniLM-L6-v2 # Lightweight text encoder for CoT representation
+  d_llm: 2048 # Output dimension for Q-Former input (MiniLM 384 automatically projects to d_llm if d_llm != 384)
+  max_tokens: 128
   device: cpu
-  target_layer: -2
-  api_key: null
-  base_url: null
+  target_layer: -2 # Only used for huggingface backend
+  api_key: null # API key for Google Gemini, OpenAI, DeepSeek, etc.
+  base_url: null # Base URL (e.g. 'http://localhost:11434' for Ollama, 'https://api.deepseek.com/v1')
+  text_cache_path: null # Path to JSON cache for generated rationales (e.g. 'outputs/artifacts/sfn_kt/llm_text_cache.json')
+
 
