@@ -40,6 +40,8 @@ def parse_cli_args():
     parser.add_argument("--test-mode", type=str, default=None, choices=["question_window", "test_fold", "full_test"], help="Test split mode: question_window (pyKT standard), test_fold, or full_test.")
     parser.add_argument("--fusion-type", type=str, default=None, choices=["mean", "vote", "all"], help="pyKT Late Fusion method for question-level evaluation.")
     parser.add_argument("--test-file", type=str, default=None, help="Custom test sequences file path override.")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="Root directory for checkpoints and artifacts.")
+    parser.add_argument("--h5-cache-path", type=str, default=None, help="Custom path for HDF5 tensor cache.")
     parser.add_argument("--smoke-test", action="store_true", help="Run minimal smoke test (1 epoch, small sample).")
     return parser.parse_known_args()
 
@@ -93,6 +95,8 @@ def run_training():
         cfg.trainer.device = cli_args.device
     if cli_args.batch_size is not None:
         cfg.trainer.batch_size = cli_args.batch_size
+    if cli_args.checkpoint_dir is not None:
+        cfg.trainer.checkpoint_dir = cli_args.checkpoint_dir
 
     if cli_args.smoke_test:
         cfg.trainer.stage1_epochs = 1
@@ -254,7 +258,7 @@ def run_training():
     )
 
 
-    h5_cache_path = artifacts_dir / "cognitive_qformer_cache.h5"
+    h5_cache_path = Path(cli_args.h5_cache_path) if cli_args.h5_cache_path else (artifacts_dir / "cognitive_qformer_cache.h5")
 
     trainer = SFNKTTrainer(
         model=model,

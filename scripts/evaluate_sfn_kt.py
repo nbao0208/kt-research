@@ -25,7 +25,8 @@ logger = setup_logger(__name__)
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="Evaluate SFN-KT model on XES3G5M test data.")
-    parser.add_argument("--checkpoint-dir", type=str, default="outputs/artifacts/sfn_kt_xes3g5m_default", help="Checkpoint directory.")
+    parser.add_argument("--experiment-name", "--exp-name", type=str, default=None, help="Experiment name to evaluate (automatically routes to outputs/artifacts/<experiment_name>).")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="Explicit checkpoint directory override.")
     parser.add_argument("--test-file", type=str, default=None, help="Evaluation sequences file override.")
     parser.add_argument("--test-mode", type=str, default=None, choices=["question_window", "test_fold", "full_test"], help="Evaluation split mode: question_window (pyKT standard), test_fold, full_test.")
     parser.add_argument("--fusion-type", type=str, default="mean", choices=["mean", "vote", "all"], help="pyKT Late Fusion method for question-level evaluation.")
@@ -40,7 +41,13 @@ def parse_cli_args():
 def main():
     args = parse_cli_args()
     device = resolve_device(args.device)
-    ckpt_dir = Path(args.checkpoint_dir)
+
+    if args.experiment_name is not None:
+        ckpt_dir = Path("outputs/artifacts") / args.experiment_name
+    elif args.checkpoint_dir is not None:
+        ckpt_dir = Path(args.checkpoint_dir)
+    else:
+        ckpt_dir = Path("outputs/artifacts/sfn_kt_xes3g5m_default")
 
     config_path = ckpt_dir / "resolved_config.yaml"
     if config_path.exists():
